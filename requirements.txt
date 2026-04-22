@@ -1,0 +1,13 @@
+# VLM inference — tested on RTX 3090 Ti, CUDA 12.x
+torch>=2.3.0
+torchvision
+transformers>=4.45.0
+accelerate>=0.30.0
+qwen-vl-utils
+Pillow>=10.0.0
+
+# Testing
+pytest>=8.0.0
+
+# Utilities
+pyyaml

@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  vlm_planner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vlm-robot-planner:latest
+    container_name: vlm_planner
+    network_mode: host          # share ROS 2 DDS with host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - ROS_DOMAIN_ID=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw   # GUI forwarding (Gazebo, RViz)
+      - ..:/workspace/src:rw               # live code mount
+    devices:
+      - /dev/dri:/dev/dri                  # GPU access for rendering
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    command: bash
