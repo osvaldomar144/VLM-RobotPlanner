@@ -54,3 +54,23 @@ class FastDownwardPlanner:
 
             lines = plan_path.read_text().splitlines()
             return [l.strip() for l in lines if l.strip() and not l.startswith(";")]
+
+    def solve_from_strings(self, domain_text: str, problem_text: str) -> list[str] | None:
+        """
+        Convenience wrapper: accepts domain and problem as strings instead of
+        file paths. Writes temporary files and calls solve().
+        """
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".pddl", delete=False
+        ) as df, tempfile.NamedTemporaryFile(
+            mode="w", suffix=".pddl", delete=False
+        ) as pf:
+            df.write(domain_text)
+            pf.write(problem_text)
+            df_name, pf_name = df.name, pf.name
+
+        try:
+            return self.solve(df_name, pf_name)
+        finally:
+            os.unlink(df_name)
+            os.unlink(pf_name)

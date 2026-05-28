@@ -20,11 +20,37 @@ class PlanStep:
     args: dict          # e.g. {"object": "red_cup"}
 
 
+_EMPTY_ADDITIONS: dict = {
+    "new_types": [],
+    "new_predicates": [],
+    "new_actions": [],
+    "modified_preconditions": {},
+}
+
+
 @dataclass
 class VLMPlan:
     goal: str
     steps: list[PlanStep]
-    raw_output: str     # raw VLM text (kept for debugging / thesis analysis)
+    raw_output: str           # raw VLM text (kept for debugging / thesis analysis)
+    domain_template: str = "manipulation_base"
+    domain_additions: dict = field(default_factory=lambda: {
+        "new_types": [],
+        "new_predicates": [],
+        "new_actions": [],
+        "modified_preconditions": {},
+    })
+
+    def to_domain_additions(self):
+        """Convert domain_additions dict → DomainAdditions for use with DomainEnricher."""
+        from planner.domain_enricher import DomainAdditions
+        d = self.domain_additions
+        return DomainAdditions(
+            new_types=d.get("new_types", []),
+            new_predicates=d.get("new_predicates", []),
+            new_actions=d.get("new_actions", []),
+            modified_preconditions=d.get("modified_preconditions", {}),
+        )
 
 
 ImageInput = Union[str, Path, Image.Image]
@@ -32,14 +58,14 @@ ImageInput = Union[str, Path, Image.Image]
 
 class VLMPlanner:
     """
-    Wraps Qwen2.5-VL to produce task plans from images + a natural language command.
+    Wraps Qwen3-VL to produce task plans from images + a natural language command.
     The VLM acts as both perception and planner: it identifies objects in the scene
     and produces a primitive sequence — no separate text description needed.
     """
 
     SYSTEM_PROMPT_PATH = Path(__file__).parent / "prompts" / "system_prompt.txt"
 
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-VL-8B-Instruct"):
         self.model_name = model_name
         self._model = None
         self._processor = None
@@ -100,7 +126,7 @@ class VLMPlanner:
         text = self._processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
         inputs = self._processor(
             text=[text],
             images=image_inputs,
@@ -119,7 +145,6 @@ class VLMPlanner:
 
     def _parse_output(self, command: str, raw: str) -> VLMPlan:
         """Extract JSON plan from VLM output. Robust to markdown code fences."""
-        # Strip ```json ... ``` wrappers if present
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
         json_str = match.group(1) if match else raw.strip()
 
@@ -127,9 +152,28 @@ class VLMPlanner:
             data = json.loads(json_str)
             steps = [PlanStep(**s) for s in data.get("steps", [])]
             goal = data.get("goal", command)
+            domain_template = data.get("domain_template", "manipulation_base")
+            domain_additions = data.get("domain_additions", {
+                "new_types": [],
+                "new_predicates": [],
+                "new_actions": [],
+                "modified_preconditions": {},
+            })
         except (json.JSONDecodeError, TypeError):
-            # Fallback: return empty plan and preserve raw for debugging
             steps = []
             goal = command
+            domain_template = "manipulation_base"
+            domain_additions = {
+                "new_types": [],
+                "new_predicates": [],
+                "new_actions": [],
+                "modified_preconditions": {},
+            }
 
-        return VLMPlan(goal=goal, steps=steps, raw_output=raw)
+        return VLMPlan(
+            goal=goal,
+            steps=steps,
+            raw_output=raw,
+            domain_template=domain_template,
+            domain_additions=domain_additions,
+        )

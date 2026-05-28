@@ -39,7 +39,8 @@ def main():
     group.add_argument("--image", nargs="+", metavar="IMG", help="Path(s) to scene image(s)")
     group.add_argument("--synthetic", action="store_true", help="Generate and use a synthetic scene")
     parser.add_argument("--task", default="pick the red object and place it next to the blue object")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--verbose", action="store_true", help="Print raw VLM output")
     args = parser.parse_args()
 
     # Resolve image paths
@@ -80,10 +81,16 @@ def main():
     for i, step in enumerate(plan.steps, 1):
         print(f"    {i}. {step.primitive}({step.args})")
 
+    if args.verbose:
+        print("\n  Raw VLM output:")
+        print("  " + "-" * 60)
+        print(f"  {plan.raw_output}")
+        print("  " + "-" * 60)
+
     if not plan.steps:
         print("\n[WARN] VLM returned no valid steps.")
-        print("  Raw output:")
-        print(f"  {plan.raw_output}")
+        if not args.verbose:
+            print(f"  Raw output: {plan.raw_output}")
         sys.exit(1)
 
     print("\n[OK] Inference test passed.")

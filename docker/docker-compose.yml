@@ -1,28 +1,52 @@
-version: "3.8"
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture:
+#   HOST  — VLM inference (Qwen3-VL) + pure-Python pipeline (GPU required)
+#   DOCKER — ROS 2 Humble + Gazebo Classic + MoveIt 2 + robot control
+#
+# Communication:
+#   network_mode: host  →  ROS 2 DDS multicast is shared; topics visible on host
+#   The host can publish task commands and subscribe to camera images directly.
+# ─────────────────────────────────────────────────────────────────────────────
 
 services:
-  vlm_planner:
+  ros2:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: vlm-robot-planner:latest
-    container_name: vlm_planner
-    network_mode: host          # share ROS 2 DDS with host
+    container_name: vlm_ros2
+
+    # Share host network: ROS 2 DDS works across host ↔ container
+    network_mode: host
+
     environment:
       - DISPLAY=${DISPLAY}
-      - ROS_DOMAIN_ID=0
+      - ROS_DOMAIN_ID=42   # valore unico per non mischiarsi con altri utenti ROS2 sul PC
+      - VLMRP_REPO_ROOT=/workspace  # repo root for planner/, vlm/, simulation/ imports
+      # Gazebo Classic model paths
+      - GAZEBO_MODEL_PATH=/usr/share/gazebo-11/models:/workspace/ros2_ws/install/vlm_robot_planner_bringup/share/vlm_robot_planner_bringup/models
+      - GAZEBO_RESOURCE_PATH=/usr/share/gazebo-11
+
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw   # GUI forwarding (Gazebo, RViz)
-      - ..:/workspace/src:rw               # live code mount
+      # X11 socket for Gazebo / RViz2 GUI
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Mount ROS2 source files so host edits are immediately visible inside
+      # container (colcon --symlink-install makes install/ point here)
+      - ../ros2_ws/src:/workspace/ros2_ws/src:rw
+      # Pure-Python modules (planner, vlm, simulation) — live edits
+      - ../planner:/workspace/planner:rw
+      - ../vlm:/workspace/vlm:rw
+      - ../simulation:/workspace/simulation:rw
+      - ../pddl:/workspace/pddl:rw
+      - ../scripts:/workspace/scripts:ro
+
     devices:
-      - /dev/dri:/dev/dri                  # GPU access for rendering
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      # GPU for Gazebo rendering (not for VLM — that stays on host)
+      - /dev/dri:/dev/dri
+
     stdin_open: true
     tty: true
+
+    # Default: open a shell. Override to launch simulation directly:
+    #   docker compose run ros2 ros2 launch vlm_robot_planner_bringup simulation.launch.py
     command: bash

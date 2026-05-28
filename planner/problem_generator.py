@@ -1,9 +1,13 @@
 """
 Generates a PDDL problem file dynamically from a VLMPlan.
 
-The VLM identifies objects and their goal state from the images.
+The VLM identifies objects, their locations, and goal state from images.
 This module converts that structured output into a valid PDDL problem
-that Fast Downward can solve.
+compatible with the domain templates in pddl/domains/.
+
+Limitation (Phase 1): initial state is inferred from plan steps (pick → object
+must be somewhere). Explicit scene state from the VLM will be added in a future
+iteration when the VLMPlan output is extended with a dedicated scene description.
 """
 
 from __future__ import annotations
@@ -12,10 +16,18 @@ from pathlib import Path
 from vlm.planner import VLMPlan, PlanStep
 
 
-# Primitives that consume an object from a location
-_PICK_PRIMITIVES = {"pick"}
-# Primitives that deposit an object at a location
-_PLACE_PRIMITIVES = {"place"}
+# Primitives that consume an object from a source
+_PICK_PRIMITIVES = {"pick", "unstack", "pick-from-container"}
+# Primitives that deposit an object at a destination
+_PLACE_PRIMITIVES = {"place", "stack", "place-in-container"}
+
+# Maps VLMPlan.domain_template → PDDL domain name (must match (define (domain ...)) in file)
+DOMAIN_TEMPLATE_TO_NAME: dict[str, str] = {
+    "manipulation_base":       "manipulation-base",
+    "manipulation_stacking":   "manipulation-stacking",
+    "containers_manipulation": "manipulation-containers",
+    "navigation_manipulation": "manipulation-navigation",
+}
 
 
 def extract_objects_and_locations(steps: list[PlanStep]) -> tuple[set[str], set[str]]:
@@ -25,7 +37,7 @@ def extract_objects_and_locations(steps: list[PlanStep]) -> tuple[set[str], set[
     Returns:
         (objects, locations) — two sets of symbolic names.
     """
-    objects: set[str] = set()
+    objects:   set[str] = set()
     locations: set[str] = set()
 
     for step in steps:
@@ -40,23 +52,20 @@ def extract_objects_and_locations(steps: list[PlanStep]) -> tuple[set[str], set[
 
 def infer_init_state(steps: list[PlanStep]) -> list[tuple[str, str]]:
     """
-    Infer the minimal initial state needed for the plan to be valid.
-
-    Strategy: for each pick(obj), the object must start somewhere.
-    If the VLM plan doesn't provide explicit initial locations,
-    we assign a generic source location per object.
+    Infer the minimal initial state: for each picked object, it must start
+    somewhere. If the VLM plan specifies a 'source' key, use that; otherwise
+    generate a default source location name.
 
     Returns:
-        List of (object, location) pairs representing the :init state.
+        List of (object, location) pairs for the :init (on ...) facts.
     """
-    init: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    init:  list[tuple[str, str]] = []
+    seen:  set[str] = set()
 
     for step in steps:
         if step.primitive in _PICK_PRIMITIVES:
             obj = step.args.get("object", "")
             if obj and obj not in seen:
-                # Use "source_<obj>" as default initial location when not specified
                 loc = step.args.get("source", f"source_{obj}")
                 init.append((obj, loc))
                 seen.add(obj)
@@ -66,10 +75,10 @@ def infer_init_state(steps: list[PlanStep]) -> list[tuple[str, str]]:
 
 def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, str]]:
     """
-    Infer the goal state: objects that end up at a place location.
+    Infer the goal state: objects that end up at a place destination.
 
     Returns:
-        List of (object, location) pairs representing the :goal.
+        List of (object, location) pairs for the :goal (on ...) facts.
     """
     goal: list[tuple[str, str]] = []
 
@@ -85,25 +94,33 @@ def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, str]]:
 
 def generate_problem(
     plan: VLMPlan,
-    domain_name: str = "manipulation",
+    domain_name: str | None = None,
     problem_name: str = "generated_problem",
 ) -> str:
     """
     Generate a PDDL problem string from a VLMPlan.
 
+    The domain name is resolved automatically from plan.domain_template
+    unless overridden by the domain_name parameter.
+
     Args:
         plan:         Output of VLMPlanner.plan().
-        domain_name:  Must match the domain defined in pddl/domain/.
+        domain_name:  Override the domain name. If None, derived from
+                      plan.domain_template via DOMAIN_TEMPLATE_TO_NAME.
         problem_name: Label for the generated problem (informational).
 
     Returns:
         PDDL problem as a string, ready to be written to a .pddl file.
     """
+    if domain_name is None:
+        domain_name = DOMAIN_TEMPLATE_TO_NAME.get(
+            plan.domain_template, "manipulation-base"
+        )
+
     objects, locations = extract_objects_and_locations(plan.steps)
     init_pairs = infer_init_state(plan.steps)
     goal_pairs = infer_goal_state(plan.steps)
 
-    # Collect all locations (including inferred source locations from init)
     all_locations = locations | {loc for _, loc in init_pairs}
 
     lines: list[str] = []
@@ -111,8 +128,8 @@ def generate_problem(
     lines.append(f"  (:domain {domain_name})")
     lines.append("")
 
-    # Objects
-    obj_str = " ".join(sorted(objects)) + " - object" if objects else ""
+    # Objects — use 'item' and 'location' types to match the new domain templates
+    obj_str = " ".join(sorted(objects)) + " - item"     if objects       else ""
     loc_str = " ".join(sorted(all_locations)) + " - location" if all_locations else ""
     lines.append("  (:objects")
     if obj_str:
@@ -126,7 +143,9 @@ def generate_problem(
     lines.append("  (:init")
     for obj, loc in init_pairs:
         lines.append(f"    (on {obj} {loc})")
-    # Add reachable facts for all known locations
+    # All items start clear (nothing stacked on them) — required by stacking template
+    for obj in sorted(objects):
+        lines.append(f"    (clear {obj})")
     for loc in sorted(all_locations):
         lines.append(f"    (reachable {loc})")
     lines.append("    (gripper-empty)")
@@ -154,15 +173,10 @@ def generate_problem(
 def write_problem(
     plan: VLMPlan,
     output_path: str | Path,
-    domain_name: str = "manipulation",
+    domain_name: str | None = None,
 ) -> Path:
     """
     Generate and write the PDDL problem to a file.
-
-    Args:
-        plan:        VLMPlan from the VLM module.
-        output_path: Where to write the .pddl file.
-        domain_name: Domain name to reference in the problem.
 
     Returns:
         Path to the written file.

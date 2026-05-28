@@ -1,7 +1,7 @@
-# VLM inference — tested on RTX 3090 Ti, CUDA 12.x
+# VLM inference — Qwen3-VL-8B-Instruct, tested on RTX 3090 Ti, CUDA 12.x
 torch>=2.3.0
 torchvision
-transformers>=4.45.0
+transformers>=4.50.0
 accelerate>=0.30.0
 qwen-vl-utils
 Pillow>=10.0.0

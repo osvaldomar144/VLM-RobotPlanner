@@ -224,3 +224,6 @@ models/
 
 # Logs
 logs/
+
+#custom
+/appunti
