@@ -8,7 +8,10 @@ Role in the pipeline:
     to an actual pose in the robot base frame (panda_link0).
 
 GazeboOracle queries the Gazebo Classic service /gazebo/get_entity_state.
-The service is exposed by the libgazebo_ros_state.so plugin (loaded in
+GazeboAttach simulates gripper attachment by continuously setting the object
+pose to track the EEF via TF + /gazebo/set_entity_state.
+
+Both services are exposed by the libgazebo_ros_state.so plugin (loaded in
 tabletop.world with <namespace>/gazebo</namespace>).
 
 WorldState is the pure-Python data container used by the Orchestrator.
@@ -188,3 +191,150 @@ class GazeboOracle:
                     f"GazeboOracle: skipping '{name}' — pose unavailable."
                 )
         return WorldState(objects=object_states, gripper_empty=True)
+
+
+# ── Gazebo simulated attachment ───────────────────────────────────────────────
+
+class GazeboAttach:
+    """
+    Simulates gripper-object attachment in Gazebo Classic.
+
+    Gazebo Classic does not provide force-based grasping without a dedicated
+    grasp plugin. This class implements kinematic attachment: after
+    close_gripper(), call attach() to have the object track the EEF frame
+    via TF + /gazebo/set_entity_state. Call detach() after open_gripper().
+
+    The world position of the held object is updated at ~20 Hz as:
+      object_world_z = panda_hand_panda_link0_z + ROBOT_BASE_Z - grasp_offset_z
+
+    For a top-down grasp (EEF z-axis points down), this places the object
+    directly below the EEF by grasp_offset_z metres in world z.
+
+    Requires:
+      - /gazebo/set_entity_state service (libgazebo_ros_state.so plugin)
+      - tf2_ros running (provided by robot_state_publisher)
+    """
+
+    SET_SERVICE = "/gazebo/set_entity_state"
+
+    # Robot (panda_link0) spawn position in Gazebo world frame.
+    # Must match the spawn pose in the launch file.
+    _ROBOT_BASE_WORLD_X = 0.20
+    _ROBOT_BASE_WORLD_Y = 0.00
+    _ROBOT_BASE_WORLD_Z = 0.77
+
+    def __init__(
+        self,
+        node,
+        eef_frame: str = "panda_hand",
+    ) -> None:
+        from gazebo_msgs.srv import SetEntityState
+        import tf2_ros
+
+        self._node      = node
+        self._eef_frame = eef_frame
+
+        self._client = node.create_client(SetEntityState, self.SET_SERVICE)
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, node)
+
+        self._timer:          object | None = None
+        self._attached:       str | None    = None
+        self._grasp_offset_z: float         = 0.0
+
+        node.get_logger().info(
+            f"GazeboAttach: waiting for {self.SET_SERVICE} ..."
+        )
+        if not self._client.wait_for_service(timeout_sec=5.0):
+            node.get_logger().warn(
+                f"GazeboAttach: {self.SET_SERVICE} not available — "
+                "simulated attachment disabled."
+            )
+        else:
+            node.get_logger().info("GazeboAttach: service ready.")
+
+    def attach(self, object_name: str, grasp_offset_z: float = 0.10) -> None:
+        """
+        Start tracking EEF with the named object at ~20 Hz.
+
+        Args:
+            object_name:    Gazebo model name to track.
+            grasp_offset_z: Metres below EEF in world z (top-down grasp only).
+        """
+        self._attached       = object_name
+        self._grasp_offset_z = grasp_offset_z
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = self._node.create_timer(0.05, self._update)
+        self._node.get_logger().info(
+            f"GazeboAttach: '{object_name}' now tracking '{self._eef_frame}' "
+            f"(offset z={grasp_offset_z:.3f} m)"
+        )
+
+    def detach(self) -> str | None:
+        """
+        Stop tracking. The object stays at its last set pose.
+
+        Returns:
+            Name of the previously attached object, or None.
+        """
+        obj = self._attached
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        self._attached = None
+        if obj:
+            self._node.get_logger().info(
+                f"GazeboAttach: '{obj}' detached — physics resumes."
+            )
+        return obj
+
+    def set_world_pose(
+        self, object_name: str, x: float, y: float, z: float
+    ) -> None:
+        """Immediately teleport object to a world-frame position (upright)."""
+        self._call_set_state(object_name, x, y, z)
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _update(self) -> None:
+        if self._attached is None:
+            return
+        try:
+            from rclpy.time import Time
+
+            # Look up panda_hand in panda_link0 frame (always in TF tree).
+            t = self._tf_buffer.lookup_transform(
+                "panda_link0", self._eef_frame, Time()
+            )
+            hand_x = t.transform.translation.x
+            hand_y = t.transform.translation.y
+            hand_z = t.transform.translation.z
+
+            # Convert panda_link0 → world by adding robot base spawn offset.
+            world_x = self._ROBOT_BASE_WORLD_X + hand_x
+            world_y = self._ROBOT_BASE_WORLD_Y + hand_y
+            # For top-down grasp, EEF z-axis = world -z → object is below.
+            world_z = self._ROBOT_BASE_WORLD_Z + hand_z - self._grasp_offset_z
+
+            self._call_set_state(self._attached, world_x, world_y, world_z)
+        except Exception:
+            pass  # TF not ready or stale — skip this tick
+
+    def _call_set_state(
+        self, name: str, x: float, y: float, z: float
+    ) -> None:
+        from gazebo_msgs.srv import SetEntityState
+        from gazebo_msgs.msg import EntityState
+
+        state                    = EntityState()
+        state.name               = name
+        state.reference_frame    = "world"
+        state.pose.position.x    = x
+        state.pose.position.y    = y
+        state.pose.position.z    = z
+        state.pose.orientation.w = 1.0  # upright
+
+        req       = SetEntityState.Request()
+        req.state = state
+        self._client.call_async(req)

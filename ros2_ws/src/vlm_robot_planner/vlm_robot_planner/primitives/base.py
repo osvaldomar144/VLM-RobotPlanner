@@ -44,7 +44,9 @@ BASE_FRAME = "panda_link0"
 EEF_LINK   = "panda_hand"
 
 _GRIPPER_OPEN   = 0.04   # metres per finger (8 cm total opening)
-_GRIPPER_CLOSED = 0.00   # fully closed
+# Grip position tuned for red_cup (radius = 0.025 m → diameter = 0.05 m).
+# 2 mm inside the cup surface per finger → firm contact without physics penetration.
+_GRIPPER_CLOSED = 0.023
 _GRIPPER_EFFORT = 20.0   # N — enough for lightweight objects
 
 # Top-down grasp orientation: 180° rotation around x → end-effector points down.
@@ -75,7 +77,7 @@ class ArmPrimitive:
         frame_id:   str   = BASE_FRAME,
         timeout_sec: float = 15.0,
     ) -> bool:
-        """Plan and execute a Cartesian goal for the arm via pymoveit2."""
+        """Plan and execute a Cartesian goal (OMPL, free-space path)."""
         self._moveit2.move_to_pose(
             position=[pose.position.x, pose.position.y, pose.position.z],
             quat_xyzw=[
@@ -86,10 +88,42 @@ class ArmPrimitive:
             ],
             cartesian=False,
         )
-        result = self._moveit2.wait_until_executed()
+        result = self._moveit2.wait_until_executed(timeout=timeout_sec)
         if not result:
             self._node.get_logger().warn("ArmPrimitive: move_to_pose failed.")
             return False
+        return True
+
+    def move_to_pose_linear(
+        self,
+        pose:        Pose,
+        timeout_sec: float = 15.0,
+    ) -> bool:
+        """Plan a smooth Cartesian pose motion (PILZ PTP, OMPL fallback).
+
+        Primary: PILZ PTP — deterministic, smooth joint-space interpolation
+        that produces near-straight Cartesian paths for small displacements.
+        Fallback: OMPL — used if PILZ rejects the goal.
+        """
+        quat = [pose.orientation.x, pose.orientation.y,
+                pose.orientation.z, pose.orientation.w]
+        pos  = [pose.position.x, pose.position.y, pose.position.z]
+
+        self._moveit2.move_to_pose_linear(position=pos, quat_xyzw=quat)
+        result = self._moveit2.wait_until_executed(timeout=timeout_sec)
+
+        if not result:
+            self._node.get_logger().warn(
+                "ArmPrimitive: PILZ PTP failed — falling back to OMPL."
+            )
+            self._moveit2.move_to_pose(position=pos, quat_xyzw=quat)
+            result = self._moveit2.wait_until_executed(timeout=timeout_sec)
+            if not result:
+                self._node.get_logger().warn(
+                    "ArmPrimitive: move_to_pose_linear (OMPL fallback) also failed."
+                )
+                return False
+
         return True
 
     def move_to_named(self, config_name: str) -> bool:

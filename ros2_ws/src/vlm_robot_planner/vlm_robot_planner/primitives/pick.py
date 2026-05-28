@@ -25,11 +25,15 @@ from rclpy.node import Node
 
 from vlm_robot_planner.primitives.base import ArmPrimitive, _TOP_DOWN_QUAT
 
-# Grasp approach height above the object centre
+# Grasp approach height above the grasp pose (pre-grasp clearance)
 _APPROACH_HEIGHT_M = 0.15
 
-# How far above the final grasp position the gripper starts (approach clearance)
-_GRASP_OFFSET_Z_M = 0.02   # slight offset above object center to avoid collision
+# Height of panda_hand above the object centre at the grasp pose.
+# Franka finger length below panda_hand frame ≈ 0.13 m (58 mm joint offset + 75 mm finger).
+# With _GRASP_OFFSET_Z_M = 0.10 and red_cup centre at z=0.06 m:
+#   panda_hand z = 0.16 m → finger tips z ≈ 0.03 m (safely above table surface at z=0.00)
+#   pre-grasp z = 0.31 m (matches smoke-test goal)
+_GRASP_OFFSET_Z_M = 0.10
 
 
 class PickPrimitive(ArmPrimitive):
@@ -38,11 +42,14 @@ class PickPrimitive(ArmPrimitive):
 
     Args:
         node:   rclpy Node (Orchestrator).
-        moveit: MoveItPy instance shared with all other primitives.
+        moveit: MoveIt2Client instance shared with all other primitives.
+        attach: Optional GazeboAttach for simulated object attachment.
+                If provided, the object will follow the EEF during the lift.
     """
 
-    def __init__(self, node: Node, moveit) -> None:
+    def __init__(self, node: Node, moveit, attach=None) -> None:
         super().__init__(node, moveit)
+        self._attach = attach
 
     def execute(self, object_name: str, pose_data: dict) -> bool:
         """
@@ -51,7 +58,7 @@ class PickPrimitive(ArmPrimitive):
         Args:
             object_name: Symbolic object name (for logging).
             pose_data:   Pose dict from GazeboOracle:
-                         {"position": Point, "orientation": Quaternion}
+                         {"position": Position, "orientation": Orientation}
 
         Returns:
             True if the full pick sequence completed successfully.
@@ -67,27 +74,32 @@ class PickPrimitive(ArmPrimitive):
             self._log("open_gripper failed — aborting pick")
             return False
 
-        # ── 2. Pre-grasp (above object) ────────────────────────────────────
+        # ── 2. Pre-grasp (above object) — OMPL free-space approach ────────
         self._log(f"  → moving to pre-grasp (z={pre_grasp.position.z:.3f})")
         if not self.move_to_pose(pre_grasp):
             self._log("pre-grasp planning failed — aborting pick")
             return False
 
-        # ── 3. Descend to grasp ────────────────────────────────────────────
+        # ── 3. Descend to grasp — PILZ LIN (straight vertical line) ───────
         self._log(f"  → descending to grasp (z={grasp_pose.position.z:.3f})")
-        if not self.move_to_pose(grasp_pose):
+        if not self.move_to_pose_linear(grasp_pose):
             self._log("grasp descend failed — aborting pick")
             return False
 
         # ── 4. Close gripper ───────────────────────────────────────────────
         if not self.close_gripper():
             self._log("close_gripper failed — object may have slipped")
-            # Continue anyway: attempt retreat even if grasp uncertain
 
-        # ── 5. Lift (retreat to pre-grasp) ────────────────────────────────
+        # ── 4b. Start simulated attachment ─────────────────────────────────
+        if self._attach is not None:
+            self._attach.attach(object_name, grasp_offset_z=_GRASP_OFFSET_Z_M)
+
+        # ── 5. Lift — PILZ LIN (straight vertical, object follows EEF) ────
         self._log("  → lifting object")
-        if not self.move_to_pose(pre_grasp):
+        if not self.move_to_pose_linear(pre_grasp):
             self._log("lift failed — object may be stuck")
+            if self._attach is not None:
+                self._attach.detach()
             return False
 
         self._log(f"pick('{object_name}'): SUCCESS")

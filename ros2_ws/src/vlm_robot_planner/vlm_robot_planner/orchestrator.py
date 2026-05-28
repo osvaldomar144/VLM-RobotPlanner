@@ -42,7 +42,7 @@ sys.path.insert(0, _REPO_ROOT)
 
 from planner.pipeline import Pipeline, PipelineResult
 from planner.plan_parser import PrimitiveCall
-from simulation.oracle.world_state import GazeboOracle
+from simulation.oracle.world_state import GazeboOracle, GazeboAttach
 
 
 # All Gazebo model names the oracle tracks by default
@@ -63,8 +63,9 @@ class Orchestrator(Node):
         # Populated in _init_primitives() after MoveIt2 is ready.
         self._prim_dispatch: dict[str, Any] = {}
 
-        # ── Oracle ────────────────────────────────────────────────────────
-        self._oracle = GazeboOracle(node=self, reference_frame="panda_link0")
+        # ── Oracle + simulated attachment ─────────────────────────────────
+        self._oracle  = GazeboOracle(node=self, reference_frame="panda_link0")
+        self._attach  = GazeboAttach(node=self, eef_frame="panda_hand")
 
         # ── Camera image buffer ───────────────────────────────────────────
         self._latest_image: Image | None = None
@@ -186,8 +187,8 @@ class Orchestrator(Node):
         moveit2.max_velocity     = 0.3
         moveit2.max_acceleration = 0.3
 
-        pick  = PickPrimitive(self, moveit2)
-        place = PlacePrimitive(self, moveit2)
+        pick  = PickPrimitive(self, moveit2, attach=self._attach)
+        place = PlacePrimitive(self, moveit2, attach=self._attach)
         look  = LookAtPrimitive(self, moveit2)
         nav   = NavigateToPrimitive(self)
 

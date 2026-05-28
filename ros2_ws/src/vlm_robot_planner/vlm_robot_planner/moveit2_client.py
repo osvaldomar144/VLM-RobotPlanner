@@ -87,8 +87,30 @@ class MoveIt2Client:
         quat_xyzw:  List[float],
         cartesian:  bool = False,
     ) -> None:
-        """Start a Cartesian-goal motion (non-blocking)."""
+        """Start a Cartesian-goal motion (non-blocking). Uses OMPL."""
         self._send_goal_async(self._build_pose_goal(position, quat_xyzw))
+
+    def move_to_pose_linear(
+        self,
+        position:  List[float],
+        quat_xyzw: List[float],
+    ) -> None:
+        """Start a smooth Cartesian-goal motion using PILZ PTP (non-blocking).
+
+        PILZ PTP solves IK for the target pose and interpolates in joint space,
+        producing smooth, deterministic, near-straight Cartesian paths for small
+        displacements (e.g. 15 cm descend/lift in pick/place).
+
+        Note: PILZ LIN (geometrically straight line) fails with error_code=-1
+        for Cartesian constraint goals — PTP is used as the reliable alternative.
+        The caller (ArmPrimitive.move_to_pose_linear) falls back to OMPL if this
+        also fails.
+        """
+        goal = self._build_pose_goal(position, quat_xyzw)
+        goal.request.pipeline_id   = "pilz_industrial_motion_planner"
+        goal.request.planner_id    = "PTP"
+        goal.request.num_planning_attempts = 1  # PILZ is deterministic
+        self._send_goal_async(goal)
 
     def move_to_configuration(self, joint_positions: List[float]) -> None:
         """Start a joint-space-goal motion (non-blocking)."""
@@ -152,6 +174,8 @@ class MoveIt2Client:
 
     def _build_joint_goal(self, joint_positions: List[float]) -> MoveGroup.Goal:
         request = self._base_request()
+        request.pipeline_id = "pilz_industrial_motion_planner"
+        request.planner_id  = "PTP"
 
         goal_c = Constraints()
         for name, pos in zip(self._joint_names, joint_positions):
