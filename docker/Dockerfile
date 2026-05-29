@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y \
     python3-colcon-common-extensions \
     python3-vcstool \
     python3-rosdep \
+    # Fast Downward build dependencies
+    cmake \
+    g++ \
+    libglib2.0-dev \
     # MoveIt 2 (arm motion planning)
     ros-humble-moveit \
     ros-humble-moveit-ros-planning-interface \
@@ -71,6 +75,11 @@ RUN bash -c "\
       --cmake-args -DCMAKE_BUILD_TYPE=Release \
       --packages-select gazebo_ros2_control \
       --event-handlers console_direct+"
+
+# Fast Downward PDDL planner — build from source (takes ~2-3 min)
+RUN git clone --depth 1 https://github.com/aibasel/downward.git /opt/fast-downward \
+ && cd /opt/fast-downward && python3 build.py \
+ && ln -sf /opt/fast-downward/fast-downward.py /usr/local/bin/fast-downward
 
 WORKDIR /workspace
 

@@ -23,6 +23,7 @@ remains responsive during the (slow) GPU model load.
 
 from __future__ import annotations
 
+import json
 import sys
 import os
 import threading
@@ -81,6 +82,16 @@ class Orchestrator(Node):
             String,
             "/vlm_planner/task_command",
             self._command_callback,
+            qos_profile=10,
+        )
+
+        # ── Inject pre-computed VLMPlan (from host GPU) ───────────────────
+        # Payload: JSON {"command": "...", "vlm_plan": { <VLMPlan fields> }}
+        # Skips VLM inference; goes straight to PDDL validation + execution.
+        self._inject_sub = self.create_subscription(
+            String,
+            "/vlm_planner/inject_plan",
+            self._inject_plan_callback,
             qos_profile=10,
         )
 
@@ -231,15 +242,44 @@ class Orchestrator(Node):
             target=self._run_task, args=(command,), daemon=True
         ).start()
 
+    def _inject_plan_callback(self, msg: String) -> None:
+        """Receive a JSON-encoded VLMPlan from the host GPU and execute it.
+
+        Expected payload:
+            {"command": "<task text>", "vlm_plan": { <VLMPlan fields> }}
+        Skips VLM inference; uses Pipeline.run(vlm_plan=...) directly.
+        """
+        if self._busy:
+            self.get_logger().warn("Orchestrator busy — ignoring injected plan.")
+            self._publish_status("busy — ignoring injected plan")
+            return
+
+        try:
+            data = json.loads(msg.data)
+            command  = data.get("command", "injected plan")
+            from vlm.planner import VLMPlan
+            vlm_plan = VLMPlan.from_json(json.dumps(data["vlm_plan"]))
+        except Exception as exc:
+            self.get_logger().error(f"inject_plan: invalid JSON — {exc}")
+            return
+
+        self.get_logger().info(
+            f"Injected plan received: '{command}' "
+            f"({len(vlm_plan.steps)} steps)"
+        )
+        threading.Thread(
+            target=self._run_task, args=(command, vlm_plan), daemon=True
+        ).start()
+
     # ── Task execution ────────────────────────────────────────────────────────
 
-    def _run_task(self, command: str) -> None:
+    def _run_task(self, command: str, vlm_plan=None) -> None:
         with self._task_lock:
             self._busy = True
             self._publish_status(f"busy — planning: {command}")
             success = False
             try:
-                success = self.run(command)
+                success = self.run(command, vlm_plan=vlm_plan)
             except Exception as exc:
                 self.get_logger().error(f"Orchestrator: unhandled exception: {exc}")
                 import traceback
@@ -248,29 +288,34 @@ class Orchestrator(Node):
                 self._busy = False
                 self._publish_status("ready" if success else f"error — task failed: {command}")
 
-    def run(self, command: str) -> bool:
+    def run(self, command: str, vlm_plan=None) -> bool:
         """
         Execute one full task:
           images → VLM → PDDL pipeline → primitives → robot.
+
+        Args:
+            command:  Natural language task description.
+            vlm_plan: Pre-computed VLMPlan (skips VLM inference when provided).
 
         Returns:
             True if all primitives executed successfully.
         """
         self.get_logger().info(f"Task: '{command}'")
 
-        # Convert latest ROS2 Image to PIL
+        # Convert latest ROS2 Image to PIL (skip if VLMPlan already provided)
         images = []
-        if self._latest_image is not None:
-            pil = self._ros_image_to_pil(self._latest_image)
-            if pil is not None:
-                images = [pil]
+        if vlm_plan is None:
+            if self._latest_image is not None:
+                pil = self._ros_image_to_pil(self._latest_image)
+                if pil is not None:
+                    images = [pil]
+                else:
+                    self.get_logger().warn("Image conversion failed — running VLM without image.")
             else:
-                self.get_logger().warn("Image conversion failed — running VLM without image.")
-        else:
-            self.get_logger().warn("No camera frame available — running VLM without image.")
+                self.get_logger().warn("No camera frame available — running VLM without image.")
 
-        # Run planning pipeline
-        result: PipelineResult = self._pipeline.run(command, images)
+        # Run planning pipeline (vlm_plan=None → full VLM inference; otherwise skip VLM)
+        result: PipelineResult = self._pipeline.run(command, images, vlm_plan=vlm_plan)
 
         if not result.success:
             self.get_logger().error(

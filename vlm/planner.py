@@ -52,6 +52,30 @@ class VLMPlan:
             modified_preconditions=d.get("modified_preconditions", {}),
         )
 
+    def to_json(self) -> str:
+        """Serialize to JSON string (for host→container transport)."""
+        return json.dumps({
+            "goal": self.goal,
+            "steps": [{"primitive": s.primitive, "args": s.args} for s in self.steps],
+            "raw_output": self.raw_output,
+            "domain_template": self.domain_template,
+            "domain_additions": self.domain_additions,
+        })
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "VLMPlan":
+        """Deserialize from JSON string."""
+        data = json.loads(json_str)
+        steps = [PlanStep(primitive=s["primitive"], args=s["args"])
+                 for s in data.get("steps", [])]
+        return cls(
+            goal=data["goal"],
+            steps=steps,
+            raw_output=data.get("raw_output", ""),
+            domain_template=data.get("domain_template", "manipulation_base"),
+            domain_additions=data.get("domain_additions", _EMPTY_ADDITIONS.copy()),
+        )
+
 
 ImageInput = Union[str, Path, Image.Image]
 
