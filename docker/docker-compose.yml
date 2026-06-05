@@ -19,6 +19,11 @@ services:
     # Share host network: ROS 2 DDS works across host ↔ container
     network_mode: host
 
+    # Share host IPC namespace: required for MIT-SHM X11 shared memory.
+    # Without this, Mesa's software renderer can't transfer pixels to the
+    # X server via XShmPutImage → Gazebo viewport shows black.
+    ipc: host
+
     environment:
       - DISPLAY=${DISPLAY}
       - ROS_DOMAIN_ID=42   # valore unico per non mischiarsi con altri utenti ROS2 sul PC
@@ -39,6 +44,10 @@ services:
       - ../simulation:/workspace/simulation:rw
       - ../pddl:/workspace/pddl:rw
       - ../scripts:/workspace/scripts:ro
+      # Shared data dir: container writes scene images, host reads them for VLM
+      - ../data:/workspace/data:rw
+      # Gazebo recordings/screenshots → visibili sull'host in data/gazebo/
+      - ../data/gazebo:/root/.gazebo:rw
 
     devices:
       # GPU for Gazebo rendering (not for VLM — that stays on host)

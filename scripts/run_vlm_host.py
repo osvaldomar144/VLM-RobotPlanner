@@ -21,6 +21,12 @@ Usage:
 
     # Synthetic image (for testing without a real scene)
     python3 scripts/run_vlm_host.py --task "..." --synthetic
+
+    # Capture scene from Gazebo camera and run VLM (full end-to-end)
+    python3 scripts/run_vlm_host.py \\
+        --task "pick the red cup and place it on the shelf" \\
+        --capture \\
+        --container vlm_ros2
 """
 
 from __future__ import annotations
@@ -63,14 +69,61 @@ def main() -> None:
         help="Skip VLM inference; inject a hardcoded pick+place plan (for testing injection only)"
     )
     parser.add_argument(
+        "--capture", action="store_true",
+        help="Capture one frame from /wrist_camera/image_raw inside the container "
+             "before running VLM (saved to data/scene.png)"
+    )
+    parser.add_argument(
         "--container", default="vlm_ros2",
         help="Docker container name (default: vlm_ros2)"
+    )
+    parser.add_argument(
+        "--sudo-docker", action="store_true",
+        help="Prepend sudo to docker commands (use if not in docker group)"
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print JSON plan without publishing to the container"
     )
+    parser.add_argument(
+        "--use-bbox-grounding", action="store_true",
+        help="Use VLM bbox + camera projection for grounding (Phase 2 / real robot). "
+             "Disabled by default in simulation (overview camera perspective too unusual)."
+    )
+    parser.add_argument(
+        "--items", nargs="*", default=[], metavar="NAME",
+        help="Known PDDL item names passed to VLM (e.g. --items red_cup blue_box)"
+    )
+    parser.add_argument(
+        "--locations", nargs="*", default=[], metavar="NAME",
+        help="Known PDDL location names passed to VLM (e.g. --locations shelf_b)"
+    )
     args = parser.parse_args()
+
+    # ── Capture scene from Gazebo camera ─────────────────────────────────────
+    _SCENE_PATH = _REPO_ROOT / "data" / "scene.png"
+
+    _docker = ["sudo", "docker"] if args.sudo_docker else ["docker"]
+
+    if args.capture:
+        print("[INFO] Capturing scene from /wrist_camera/image_raw…")
+        bash_cmd = (
+            "source /opt/ros/humble/setup.bash && "
+            "source /workspace/ros2_ws/install/setup.bash && "
+            "python3 /workspace/scripts/_capture_scene.py"
+        )
+        cap_result = subprocess.run(
+            _docker + ["exec", args.container, "bash", "-c", bash_cmd],
+            capture_output=True,
+        )
+        output = cap_result.stdout.decode().strip()
+        if cap_result.returncode != 0:
+            err = cap_result.stderr.decode().strip()
+            print(f"[FAIL] Capture failed: {err}")
+            sys.exit(1)
+        print(f"[OK]   {output}")
+        if not args.image:
+            args.image = [str(_SCENE_PATH)]
 
     # ── Build plan ────────────────────────────────────────────────────────────
     from vlm.planner import VLMPlan, PlanStep
@@ -109,14 +162,166 @@ def main() -> None:
         vlm.load()
         print("[OK]   VLM loaded.\n")
 
-        print(f"[INFO] Running inference for: '{args.task}'")
-        plan = vlm.plan(args.task, images)
+        # ── Discover scene objects + poses from Gazebo ───────────────────────────
+        # Query /gazebo/model_states: returns names AND 3D positions.
+        # Used for (a) bbox-based spatial grounding and (b) OWL-ViT fallback.
+        gazebo_models: list[str]       = []   # names only (for OWL-ViT fallback)
+        gazebo_poses:  dict[str, dict] = {}   # name → {x,y,z} (for bbox grounding)
+        if args.capture or not args.no_vlm:
+            bash_cmd = (
+                "source /opt/ros/humble/setup.bash && "
+                "source /workspace/ros2_ws/install/setup.bash && "
+                "python3 /workspace/scripts/_get_model_states.py"
+            )
+            ms_result = subprocess.run(
+                _docker + ["exec", args.container, "bash", "-c", bash_cmd],
+                capture_output=True,
+            )
+            if ms_result.returncode == 0:
+                import json as _json
+                ms_data      = _json.loads(ms_result.stdout.decode().strip())
+                gazebo_poses = ms_data.get("models", {})
+                gazebo_models = list(gazebo_poses.keys())
+                print(f"[INFO] Gazebo scene objects: {gazebo_models}")
+            else:
+                print("[WARN] Could not query Gazebo model states — grounding disabled.")
 
-    print(f"[OK]   Goal: {plan.goal}")
-    print(f"       Domain template: {plan.domain_template}")
-    print(f"       Steps ({len(plan.steps)}):")
+        # ── VLM inference: NO vocabulary hints (fully adaptive) ───────────────
+        # The VLM reasons from the image alone — it does NOT receive a list of
+        # known object names.  Names are corrected after inference via
+        # PerceptionModule visual grounding against the Gazebo scene objects.
+        # Modalità A (with hints) is still available via --items/--locations
+        # for comparison / ablation studies.
+        scene_context = None
+        if args.items or args.locations:
+            scene_context = {"items": args.items, "locations": args.locations}
+            print(f"[INFO] Scene context (Modalità A): items={args.items}, locations={args.locations}")
+        else:
+            print(f"[INFO] Scene context: none (Modalità B — VLM reasons freely)")
+
+        print(f"[INFO] Running inference for: '{args.task}'")
+        plan = vlm.plan(args.task, images, scene_context=scene_context)
+
+        # ── Visual grounding (two-tier) ───────────────────────────────────────
+        # Tier 1 (primary): bbox-based spatial grounding.
+        #   If the VLM output includes bbox/location_bbox fields, use camera
+        #   projection (world→pixel) to find which Gazebo model is at that
+        #   image location.  Fast, no neural network needed.
+        # Tier 2 (fallback): OWL-ViT name grounding.
+        #   If the VLM did not provide bboxes, use OWL-ViT to match names.
+        # Sim-to-real: Tier 1 works identically on the real robot — just swap
+        #   the 3D position source from oracle to RealSense depth.
+        from vlm.perception import PerceptionModule
+        perception = PerceptionModule()
+
+        # Bbox grounding is the correct architecture for Phase 2 (real robot +
+        # wrist camera eye-in-hand): the VLM generates accurate bboxes from a
+        # natural frontal perspective → spatial matching works reliably.
+        #
+        # For Phase 1 simulation the overview camera has a non-standard 3/4
+        # top-down perspective that causes the VLM to generate inaccurate bboxes.
+        # Bbox grounding is therefore DISABLED for simulation and will be enabled
+        # automatically when --use-bbox-grounding is passed (real robot flag).
+        use_bbox = args.use_bbox_grounding if hasattr(args, "use_bbox_grounding") else False
+
+        grounded = False
+        if use_bbox and gazebo_poses:
+            plan_bbox = perception.ground_names_with_bbox(plan, gazebo_poses)
+            bbox_changed = any(
+                step.args != orig.args
+                for step, orig in zip(plan_bbox.steps, plan.steps)
+            )
+            if bbox_changed:
+                plan = plan_bbox
+                grounded = True
+
+        if not grounded:
+            vocab = args.items or gazebo_models
+            locs  = args.locations if args.locations else gazebo_models
+            if images and (vocab or locs):
+                perception.load()
+                plan = perception.ground_names(
+                    plan, images[0],
+                    known_items=vocab,
+                    known_locations=locs,
+                )
+
+    # ── Verbose plan summary ──────────────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print(f"  PIANO VLM — '{plan.goal}'")
+    print("=" * 60)
+    print(f"  Domain template : {plan.domain_template}")
+    if plan.domain_additions.get("new_predicates") or \
+       plan.domain_additions.get("new_actions"):
+        print(f"  Domain additions: {plan.domain_additions}")
+    print(f"  Steps ({len(plan.steps)}):")
     for i, step in enumerate(plan.steps, 1):
-        print(f"         {i}. {step.primitive}({step.args})")
+        args_str = ", ".join(
+            f"{k}={v}" for k, v in step.args.items()
+            if k not in ("bbox", "location_bbox")
+        )
+        bbox_info = ""
+        if "bbox" in step.args:
+            bbox_info += f"  📍 {step.args['bbox']}"
+        if "location_bbox" in step.args:
+            bbox_info += f"  📍loc {step.args['location_bbox']}"
+        print(f"    {i}. {step.primitive}({args_str}){bbox_info}")
+    print("=" * 60)
+
+    # ── PDDL problem preview (from pipeline) ─────────────────────────────────
+    if not args.no_vlm and not args.dry_run:
+        try:
+            from planner.problem_generator import generate_problem
+            pddl_problem = generate_problem(plan)
+            print("\n  PDDL PROBLEM generato:")
+            print("  " + "\n  ".join(pddl_problem.splitlines()))
+            print()
+        except Exception as _e:
+            pass  # non-fatal: problema non generabile senza PDDL module
+
+    # ── Debug image: proiezioni Gazebo + bbox VLM ─────────────────────────────
+    if images and gazebo_poses:
+        try:
+            from PIL import ImageDraw, ImageFont
+            from vlm.perception import world_to_pixel
+            import numpy as np
+            debug_img = images[0].copy()
+            draw      = ImageDraw.Draw(debug_img)
+            W, H      = debug_img.size
+
+            # Draw projected Gazebo model positions (green circles + label)
+            for mname, pos in gazebo_poses.items():
+                px = world_to_pixel(np.array([pos["x"], pos["y"], pos["z"]]))
+                if px:
+                    u, v = px
+                    r = 8
+                    draw.ellipse([u-r, v-r, u+r, v+r], outline="lime", width=2)
+                    draw.text((u+10, v-8), mname, fill="lime")
+
+            # Draw VLM bounding boxes (orange for object, cyan for location)
+            for step in plan.steps:
+                bbox = step.args.get("bbox")
+                if bbox and len(bbox) == 4:
+                    x1,y1,x2,y2 = [int(x) for x in bbox]
+                    draw.rectangle([x1,y1,x2,y2], outline="orange", width=2)
+                    obj = step.args.get("object", step.args.get("target","?"))
+                    draw.text((x1, y1-12), f"pick:{obj}", fill="orange")
+                loc_bbox = step.args.get("location_bbox")
+                if loc_bbox and len(loc_bbox) == 4:
+                    x1,y1,x2,y2 = [int(x) for x in loc_bbox]
+                    draw.rectangle([x1,y1,x2,y2], outline="cyan", width=2)
+                    loc = step.args.get("location","?")
+                    draw.text((x1, y1-12), f"place:{loc}", fill="cyan")
+
+            debug_path = _REPO_ROOT / "data" / "scene_debug.png"
+            debug_img.save(str(debug_path))
+            print(f"[INFO] Debug image saved: {debug_path}")
+            print("       🟢 verde  = posizione proiettata Gazebo model")
+            print("       🟠 arancio = bbox VLM oggetto da prendere")
+            print("       🔵 ciano  = bbox VLM location di deposito")
+        except Exception as _e:
+            print(f"[WARN] Debug image failed: {_e}")
 
     # ── Serialize ─────────────────────────────────────────────────────────────
     payload = json.dumps({
@@ -138,7 +343,7 @@ def main() -> None:
         "source /workspace/ros2_ws/install/setup.bash && "
         "python3 /workspace/scripts/_publish_plan.py"
     )
-    cmd = ["docker", "exec", "-i", args.container, "bash", "-c", bash_cmd]
+    cmd = _docker + ["exec", "-i", args.container, "bash", "-c", bash_cmd]
 
     print(f"[INFO] Injecting into container '{args.container}'…")
     result = subprocess.run(

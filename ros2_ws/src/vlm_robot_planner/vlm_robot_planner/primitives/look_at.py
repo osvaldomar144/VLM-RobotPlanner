@@ -21,7 +21,7 @@ from vlm_robot_planner.primitives.base import ArmPrimitive
 # This is the "ready" pose from moveit_resources_panda_moveit_config SRDF,
 # which is defined as: [0, -π/4, 0, -3π/4, 0, π/2, π/4] (radians).
 # It positions the camera to look down at the table from ~0.5 m above.
-_OBSERVATION_CONFIG = "ready"
+_OBSERVATION_CONFIG = "scan"
 
 
 class LookAtPrimitive(ArmPrimitive):

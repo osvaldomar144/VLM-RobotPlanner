@@ -474,8 +474,10 @@
   <joint name="wrist_camera_joint" type="fixed">
     <parent link="panda_hand"/>
     <child link="wrist_camera_link"/>
-    <!-- 6 cm forward, 5 cm up, tilted 30° down toward table -->
-    <origin xyz="0.06 0.0 0.05" rpy="0 ${pi/6} 0"/>
+    <!-- Camera looks along panda_hand -Z (toward gripper tips / table).
+         panda_hand +Z points toward arm body (upward), -Z toward gripper (downward).
+         rpy="0 -pi/2 0": pitch=-90° → camera +X = -panda_hand +Z = downward toward scene. -->
+    <origin xyz="0.06 0.0 0.05" rpy="0 ${-pi/2} 0"/>
   </joint>
 
   <!-- Optical frame: ROS camera convention (z forward, x right) -->

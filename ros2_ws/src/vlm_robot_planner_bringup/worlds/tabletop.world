@@ -202,5 +202,54 @@
       </link>
     </model>
 
+    <!-- ── Overview camera: fixed, 3/4 frontal-lateral view of the table ──────
+         Position: world (1.0, 0.7, 1.5) — to the right of and slightly past
+         the table's far edge, elevated.
+         Orientation: rpy = (0, 0.68, -2.19) — looks toward table centre
+         (0.5, 0, 0.8).  Optical-axis formula: (cos(yaw)*cos(pitch),
+         sin(yaw)*cos(pitch), -sin(pitch)) → (-0.45, -0.63, -0.63) ✓
+
+         Why this position vs straight-down:
+           - Objects in foreground (x≈0.5), arm base in background (x≈0.2)
+             → arm never occludes objects regardless of joint config.
+           - y=0.7 offset puts arm (y≈0) to the left of frame centre,
+             objects (y=-0.25…+0.10) in right-centre → spatially separated.
+           - 3/4 perspective gives VLM better depth/layout understanding
+             than pure top-down view.
+
+         Phase 2+: replace with eye-in-hand RealSense D435i after look_at().
+         Topic: /overview_camera/image_raw  (640×480, 10 Hz)
+    ──────────────────────────────────────────────────────────────────────── -->
+    <model name="overview_camera">
+      <static>true</static>
+      <pose>1.0 0.7 1.5 0 0.68 -2.19</pose>
+      <link name="camera_link">
+        <visual name="vis">
+          <geometry><box><size>0.05 0.05 0.05</size></box></geometry>
+          <material><ambient>0 0 0.8 1</ambient><diffuse>0 0 0.8 1</diffuse></material>
+        </visual>
+        <sensor name="overview_camera" type="camera">
+          <update_rate>10</update_rate>
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip><near>0.05</near><far>5.0</far></clip>
+          </camera>
+          <plugin name="overview_camera_plugin" filename="libgazebo_ros_camera.so">
+            <ros>
+              <remapping>~/image_raw:=/overview_camera/image_raw</remapping>
+              <remapping>~/camera_info:=/overview_camera/camera_info</remapping>
+            </ros>
+            <camera_name>overview_camera</camera_name>
+            <frame_name>overview_camera_link</frame_name>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+
   </world>
 </sdf>

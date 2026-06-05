@@ -37,6 +37,11 @@ ARM_JOINT_NAMES = [
 # Named joint configurations (radians) — sourced from moveit_resources_panda SRDF
 _NAMED_CONFIGS = {
     "ready": [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854],
+    # Scan pose: arm extended forward-down so the wrist camera (eye-in-hand)
+    # looks at the table workspace from a natural frontal perspective.
+    # Camera has 30° built-in downward tilt (URDF rpy=0,pi/6,0) + joint6 tilt.
+    # Tune joint6 (wrist flex) if camera view is off.
+    "scan":  [0.0, -0.2, 0.0, -1.5, 0.0, 2.0, 0.7854],
 }
 
 ARM_GROUP  = "panda_arm"
@@ -124,6 +129,25 @@ class ArmPrimitive:
                 )
                 return False
 
+        return True
+
+    def move_to_pose_cartesian(
+        self,
+        pose:        Pose,
+        timeout_sec: float = 15.0,
+    ) -> bool:
+        """Move to pose via computeCartesianPath (geometrically straight line).
+
+        Falls back to PILZ PTP → OMPL when Cartesian fraction < 90% (e.g. large
+        workspace moves or paths through kinematic singularities).
+        """
+        self._moveit2.move_cartesian_waypoints([pose])
+        result = self._moveit2.wait_until_executed(timeout=timeout_sec)
+        if not result:
+            self._node.get_logger().warn(
+                "ArmPrimitive: Cartesian path incomplete — falling back to PILZ PTP."
+            )
+            return self.move_to_pose_linear(pose, timeout_sec=timeout_sec)
         return True
 
     def move_to_named(self, config_name: str) -> bool:

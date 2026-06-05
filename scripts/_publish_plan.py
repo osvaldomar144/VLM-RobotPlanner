@@ -42,13 +42,22 @@ def main() -> None:
     node = Node("_plan_injector")
     pub  = node.create_publisher(String, "/vlm_planner/inject_plan", 10)
 
-    # Brief wait so the publisher is discovered by the orchestrator
-    time.sleep(0.6)
+    # Wait until at least 1 subscriber (orchestrator) is discovered — much
+    # more reliable than a fixed sleep, which can fail when DDS discovery
+    # takes longer than expected (many active ROS2 nodes in Gazebo sessions).
+    deadline = time.time() + 10.0
+    while pub.get_subscription_count() == 0 and time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if pub.get_subscription_count() == 0:
+        print("[WARN] No subscriber discovered after 10s — publishing anyway",
+              file=sys.stderr)
 
     msg      = String()
     msg.data = payload
     pub.publish(msg)
-    time.sleep(0.2)   # let DDS flush
+    # Spin briefly so DDS flushes the outgoing message before the node exits
+    for _ in range(5):
+        rclpy.spin_once(node, timeout_sec=0.05)
 
     node.destroy_node()
     rclpy.shutdown()

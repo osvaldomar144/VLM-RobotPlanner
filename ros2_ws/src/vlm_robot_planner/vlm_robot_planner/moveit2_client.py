@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     Constraints,
@@ -32,6 +32,7 @@ from moveit_msgs.msg import (
     PositionConstraint,
     WorkspaceParameters,
 )
+from moveit_msgs.srv import GetCartesianPath
 from rclpy.action import ActionClient
 from rclpy.callback_groups import CallbackGroup
 from rclpy.node import Node
@@ -73,6 +74,17 @@ class MoveIt2Client:
             node,
             MoveGroup,
             "move_action",
+            callback_group=callback_group,
+        )
+        self._cartesian_client = node.create_client(
+            GetCartesianPath,
+            "/compute_cartesian_path",
+            callback_group=callback_group,
+        )
+        self._execute_client = ActionClient(
+            node,
+            ExecuteTrajectory,
+            "/execute_trajectory",
             callback_group=callback_group,
         )
         self._lock        = threading.Lock()
@@ -221,6 +233,130 @@ class MoveIt2Client:
         goal.request            = request
         goal.planning_options   = opts
         return goal
+
+    # ── Cartesian path planning + execution ───────────────────────────────────
+
+    def move_cartesian_waypoints(
+        self,
+        waypoints:    List[Pose],
+        max_step:     float = 0.005,
+        min_fraction: float = 0.90,
+    ) -> None:
+        """Plan a straight Cartesian path through waypoints and execute it.
+
+        Uses GetCartesianPath service (planning) + ExecuteTrajectory action
+        (execution). If the computed fraction < min_fraction, sets
+        _last_success=False immediately so the caller can fall back to
+        move_to_pose_linear / OMPL.
+
+        Non-blocking: call wait_until_executed() afterwards.
+        """
+        with self._lock:
+            self._done_event.clear()
+            self._last_success = False
+
+        threading.Thread(
+            target=self._run_cartesian,
+            args=(waypoints, max_step, min_fraction),
+            daemon=True,
+        ).start()
+
+    def _run_cartesian(
+        self,
+        waypoints:    List[Pose],
+        max_step:     float,
+        min_fraction: float,
+    ) -> None:
+        if not self._cartesian_client.wait_for_service(timeout_sec=5.0):
+            self._node.get_logger().error(
+                "MoveIt2Client: /compute_cartesian_path service not available."
+            )
+            self._done_event.set()
+            return
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id      = self._base_link
+        req.start_state.is_diff  = True
+        req.group_name           = self._group_name
+        req.link_name            = self._eef_link
+        req.waypoints            = list(waypoints)
+        req.max_step             = float(max_step)
+        req.jump_threshold       = 0.0
+        req.avoid_collisions     = True
+        # Note: max_velocity/acceleration_scaling_factor not available in
+        # GetCartesianPath.Request on ROS2 Humble — velocity is applied
+        # by the ExecuteTrajectory action using the existing scaling factors.
+
+        svc_done   = threading.Event()
+        svc_result = [None]
+
+        def _on_svc(future):
+            svc_result[0] = future.result()
+            svc_done.set()
+
+        self._cartesian_client.call_async(req).add_done_callback(_on_svc)
+        if not svc_done.wait(timeout=15.0):
+            self._node.get_logger().warn(
+                "MoveIt2Client: GetCartesianPath timed out."
+            )
+            self._done_event.set()
+            return
+
+        response = svc_result[0]
+        fraction  = response.fraction if response else 0.0
+        if response is None or fraction < min_fraction:
+            self._node.get_logger().warn(
+                f"MoveIt2Client: Cartesian path {fraction:.0%} "
+                f"(need ≥{min_fraction:.0%}) — caller should fall back."
+            )
+            self._done_event.set()
+            return
+
+        self._node.get_logger().info(
+            f"MoveIt2Client: Cartesian path {fraction:.0%} — executing."
+        )
+
+        if not self._execute_client.wait_for_server(timeout_sec=5.0):
+            self._node.get_logger().error(
+                "MoveIt2Client: /execute_trajectory action not available."
+            )
+            self._done_event.set()
+            return
+
+        exec_goal = ExecuteTrajectory.Goal()
+        exec_goal.trajectory = response.solution
+        self._execute_client.send_goal_async(exec_goal).add_done_callback(
+            self._on_exec_goal
+        )
+
+    def _on_exec_goal(self, future) -> None:
+        gh = future.result()
+        if gh is None or not gh.accepted:
+            self._node.get_logger().warn(
+                "MoveIt2Client: ExecuteTrajectory goal rejected."
+            )
+            self._done_event.set()
+            return
+        gh.get_result_async().add_done_callback(self._on_exec_result)
+
+    def _on_exec_result(self, future) -> None:
+        response = future.result()
+        if response is None:
+            self._node.get_logger().warn(
+                "MoveIt2Client: ExecuteTrajectory null result."
+            )
+        else:
+            code = response.result.error_code.val
+            self._last_success = (
+                response.status == GoalStatus.STATUS_SUCCEEDED
+                and code == _SUCCESS
+            )
+            if not self._last_success:
+                self._node.get_logger().warn(
+                    f"MoveIt2Client: ExecuteTrajectory failed — "
+                    f"status={response.status}, code={code}"
+                )
+        self._done_event.set()
 
     # ── Async dispatch ────────────────────────────────────────────────────────
 

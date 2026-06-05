@@ -228,3 +228,12 @@ logs/
 #custom
 /appunti
 CLAUDE.md
+data/*.png
+data/*.jpg
+data/*.jpeg
+data/gazebo/
+data/scan_pose_test/
+
+# Docker binary GL libraries (runtime-specific, not project code)
+docker/*.so
+docker/*.so.*

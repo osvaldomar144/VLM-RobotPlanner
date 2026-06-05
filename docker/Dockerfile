@@ -46,13 +46,26 @@ RUN apt-get update && apt-get install -y \
     # cv_bridge for camera image conversion
     ros-humble-cv-bridge \
     ros-humble-image-transport \
+    # Mesa software rendering — fixes libGL/libGLX version mismatch that causes
+    # Gazebo/OGRE black screen after Docker image rebuild.
+    # The rebuild updates libGLX_mesa (Oct 2024) but leaves libGL.so at Jan 2022,
+    # causing silent OGRE rendering failure.
+    # Explicitly installing all Mesa packages together ensures consistent versions.
+    libglvnd0 \
+    libgl1 \
+    libglx0 \
+    libglx-mesa0 \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    mesa-utils \
+    x11-utils \
     # Utils
     git wget vim curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Python packages needed inside the container (non-VLM)
 RUN pip3 install --no-cache-dir \
-    numpy \
+    "numpy<2" \
     opencv-python-headless \
     pillow \
     transforms3d

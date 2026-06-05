@@ -97,6 +97,11 @@ class Orchestrator(Node):
 
         # ── Status publisher ──────────────────────────────────────────────
         self._status_pub = self.create_publisher(String, "/vlm_planner/status", 10)
+        # ── Step-complete publisher (closed-loop support) ─────────────────
+        # Published after every primitive execution.
+        # Payload JSON: {"step": <i>, "primitive": "<name>", "success": bool,
+        #                "task_complete": bool}
+        self._step_pub = self.create_publisher(String, "/vlm_planner/step_complete", 10)
         self._publish_status("ready — VLM loading in background")
 
         # ── Load VLM weights in background thread ─────────────────────────
@@ -257,6 +262,7 @@ class Orchestrator(Node):
         try:
             data = json.loads(msg.data)
             command  = data.get("command", "injected plan")
+            direct   = data.get("direct", False)   # closed-loop: skip PDDL
             from vlm.planner import VLMPlan
             vlm_plan = VLMPlan.from_json(json.dumps(data["vlm_plan"]))
         except Exception as exc:
@@ -266,10 +272,20 @@ class Orchestrator(Node):
         self.get_logger().info(
             f"Injected plan received: '{command}' "
             f"({len(vlm_plan.steps)} steps)"
+            f"{' [direct]' if direct else ''}"
         )
-        threading.Thread(
-            target=self._run_task, args=(command, vlm_plan), daemon=True
-        ).start()
+
+        if direct:
+            # Closed-loop mode: bypass PDDL, execute VLM steps directly.
+            # Used when the VLM plans one step at a time and PDDL validation
+            # would fail due to incomplete goal inference for partial plans.
+            threading.Thread(
+                target=self._run_direct, args=(command, vlm_plan), daemon=True
+            ).start()
+        else:
+            threading.Thread(
+                target=self._run_task, args=(command, vlm_plan), daemon=True
+            ).start()
 
     # ── Task execution ────────────────────────────────────────────────────────
 
@@ -287,6 +303,55 @@ class Orchestrator(Node):
             finally:
                 self._busy = False
                 self._publish_status("ready" if success else f"error — task failed: {command}")
+
+    def _run_direct(self, command: str, vlm_plan) -> None:
+        """Execute VLM steps directly, bypassing PDDL (closed-loop mode).
+
+        Used in closed-loop iterations where the VLM plans ONE step at a time.
+        PDDL validation is skipped because partial plans (e.g. pick without place)
+        produce trivially-empty FD plans.  The VLM's decision is trusted directly.
+        """
+        with self._task_lock:
+            self._busy = True
+            self._publish_status(f"busy — direct: {command}")
+            try:
+                from planner.plan_parser import PrimitiveCall
+
+                world_state = self._oracle.get_world_state(_TRACKED_OBJECTS)
+                primitives  = []
+
+                for step in vlm_plan.steps:
+                    # Strip bbox/location_bbox — not used by primitives
+                    clean = {k: v for k, v in step.args.items()
+                             if k not in ("bbox", "location_bbox")}
+                    if step.primitive == "pick":
+                        a = [clean.get("object", "")]
+                    elif step.primitive == "place":
+                        a = [clean.get("object", ""), clean.get("location", "")]
+                    elif step.primitive in ("look_at", "navigate_to"):
+                        a = [clean.get("target", clean.get("location", ""))]
+                    else:
+                        a = list(clean.values())
+                    primitives.append(PrimitiveCall(step.primitive, a))
+
+                for i, prim in enumerate(primitives):
+                    self.get_logger().info(f"  [direct] → {prim.name}({prim.args})")
+                    ok = self._dispatch(prim, world_state)
+                    self._publish_step_complete(i, prim.name, ok,
+                                                task_complete=(i == len(primitives)-1) and ok)
+                    if not ok:
+                        self.get_logger().error(f"[direct] '{prim.name}' failed")
+                        self._publish_status(f"error — direct step failed: {prim.name}")
+                        return
+
+                self.get_logger().info("[direct] Step executed successfully.")
+                self._publish_status("ready")
+            except Exception as exc:
+                self.get_logger().error(f"_run_direct: {exc}")
+                import traceback; self.get_logger().error(traceback.format_exc())
+                self._publish_status(f"error — {exc}")
+            finally:
+                self._busy = False
 
     def run(self, command: str, vlm_plan=None) -> bool:
         """
@@ -331,10 +396,13 @@ class Orchestrator(Node):
         # Refresh world state once before dispatch
         world_state = self._oracle.get_world_state(_TRACKED_OBJECTS)
 
-        # Dispatch each primitive
-        for prim in result.primitives:
+        # Dispatch each primitive — publish step_complete after each one
+        n = len(result.primitives)
+        for i, prim in enumerate(result.primitives):
             self.get_logger().info(f"  → {prim.name}({prim.args})")
             ok = self._dispatch(prim, world_state)
+            is_last = (i == n - 1)
+            self._publish_step_complete(i, prim.name, ok, task_complete=is_last and ok)
             if not ok:
                 self.get_logger().error(
                     f"Primitive '{prim.name}' failed — aborting task."
@@ -346,6 +414,15 @@ class Orchestrator(Node):
 
     # ── Primitive dispatch ────────────────────────────────────────────────────
 
+    # Index of the arg to use for oracle pose lookup, per primitive.
+    # pick(obj)            → args[0] = object to pick
+    # place(obj, location) → args[1] = destination location
+    # look_at(obj)         → args[0] = object to observe
+    # navigate_to(loc)     → args[0] = destination
+    _ORACLE_ARG_IDX: dict[str, int] = {
+        "place": 1,
+    }
+
     def _dispatch(self, prim: PrimitiveCall, world_state) -> bool:
         """Route a PrimitiveCall to the correct handler."""
         handler = self._prim_dispatch.get(prim.name)
@@ -353,8 +430,10 @@ class Orchestrator(Node):
             self.get_logger().warn(f"Unknown primitive '{prim.name}' — skipping.")
             return True   # unknown primitives are non-fatal in Phase 1
 
-        # Resolve object/location pose from oracle
-        obj_name  = prim.args[0] if prim.args else ""
+        # Which arg identifies the target for oracle lookup?
+        arg_idx  = self._ORACLE_ARG_IDX.get(prim.name, 0)
+        obj_name = prim.args[arg_idx] if len(prim.args) > arg_idx else ""
+
         pose_data = None
         if obj_name:
             pose = world_state.get_pose(obj_name)
@@ -405,6 +484,19 @@ class Orchestrator(Node):
         msg = String()
         msg.data = status
         self._status_pub.publish(msg)
+
+    def _publish_step_complete(
+        self, step: int, primitive: str, success: bool, task_complete: bool
+    ) -> None:
+        """Publish step completion for closed-loop host monitoring."""
+        msg      = String()
+        msg.data = json.dumps({
+            "step":          step,
+            "primitive":     primitive,
+            "success":       success,
+            "task_complete": task_complete,
+        })
+        self._step_pub.publish(msg)
 
 
 def main() -> None:

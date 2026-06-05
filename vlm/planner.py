@@ -87,7 +87,8 @@ class VLMPlanner:
     and produces a primitive sequence — no separate text description needed.
     """
 
-    SYSTEM_PROMPT_PATH = Path(__file__).parent / "prompts" / "system_prompt.txt"
+    SYSTEM_PROMPT_PATH      = Path(__file__).parent / "prompts" / "system_prompt.txt"
+    SYSTEM_PROMPT_LOOP_PATH = Path(__file__).parent / "prompts" / "system_prompt_loop.txt"
 
     def __init__(self, model_name: str = "Qwen/Qwen3-VL-8B-Instruct"):
         self.model_name = model_name
@@ -99,15 +100,26 @@ class VLMPlanner:
         from vlm.model_loader import load_qwen_vl
         self._model, self._processor = load_qwen_vl(self.model_name)
 
-    def plan(self, command: str, images: list[ImageInput]) -> VLMPlan:
+    def plan(
+        self,
+        command: str,
+        images: list[ImageInput],
+        scene_context: dict | None = None,
+    ) -> VLMPlan:
         """
         Args:
-            command: Natural language task (e.g. "pick the red cup and put it on the shelf").
-            images:  One or more scene images. Accepts file paths or PIL Images.
-                     Typically: [overview_image] or [overview, close_up].
+            command:       Natural language task (e.g. "pick the red cup …").
+            images:        One or more scene images (file paths or PIL Images).
+            scene_context: Optional dict with known PDDL names, e.g.:
+                           {"items": ["red_cup", "blue_box"],
+                            "locations": ["shelf_b"]}
+                           When provided, the names are appended to the user
+                           message so the VLM uses them verbatim in its output.
+                           This prevents name-mismatch failures between VLM
+                           output and the PDDL problem / Gazebo oracle.
 
         Returns:
-            VLMPlan with primitive sequence grounded on what the VLM sees in the images.
+            VLMPlan with primitive sequence grounded on what the VLM sees.
         """
         if self._model is None:
             raise RuntimeError("Call load() before plan()")
@@ -115,9 +127,59 @@ class VLMPlanner:
         pil_images = [self._to_pil(img) for img in images]
         system_prompt = self.SYSTEM_PROMPT_PATH.read_text()
 
-        messages = self._build_messages(system_prompt, command, pil_images)
+        messages = self._build_messages(system_prompt, command, pil_images, scene_context)
         raw = self._run_inference(messages)
         return self._parse_output(command, raw)
+
+    def plan_next_step(
+        self,
+        task:            str,
+        images:          list[ImageInput],
+        completed_steps: list[str],
+    ) -> VLMPlan:
+        """Closed-loop mode: plan the NEXT SINGLE action given current state.
+
+        Args:
+            task:            Overall task description (unchanged throughout loop).
+            images:          Current scene image(s) from wrist camera.
+            completed_steps: List of already-executed primitives (e.g. ["pick(red_cup)"]).
+
+        Returns:
+            VLMPlan with 0 steps (task complete) or 1 step (next action).
+        """
+        if self._model is None:
+            raise RuntimeError("Call load() before plan_next_step()")
+
+        pil_images   = [self._to_pil(img) for img in images]
+        system_prompt = self.SYSTEM_PROMPT_LOOP_PATH.read_text()
+
+        # Build user message with task context and completed steps
+        completed_str = (
+            "\n".join(f"  - {s}" for s in completed_steps)
+            if completed_steps else "  (none yet)"
+        )
+        user_text = (
+            f"Task goal: {task}\n\n"
+            f"Completed steps:\n{completed_str}\n\n"
+            f"What is the NEXT single action?"
+        )
+
+        messages = self._build_messages(system_prompt, user_text, pil_images)
+        raw = self._run_inference(messages)
+        plan = self._parse_output(task, raw)
+
+        # Handle complete=true signal
+        try:
+            data = __import__("json").loads(
+                raw if raw.strip().startswith("{") else
+                __import__("re").search(r"\{.*\}", raw, __import__("re").DOTALL).group()
+            )
+            if data.get("complete"):
+                plan.steps = []   # empty steps = task done
+        except Exception:
+            pass
+
+        return plan
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -133,13 +195,22 @@ class VLMPlanner:
         system_prompt: str,
         command: str,
         images: list[Image.Image],
+        scene_context: dict | None = None,
     ) -> list[dict]:
         image_content = [{"type": "image", "image": img} for img in images]
+        user_text = command
+        if scene_context:
+            parts = ["\n\nKnown PDDL names — use these EXACTLY in your JSON output:"]
+            if scene_context.get("items"):
+                parts.append(f"  Items: {', '.join(scene_context['items'])}")
+            if scene_context.get("locations"):
+                parts.append(f"  Locations: {', '.join(scene_context['locations'])}")
+            user_text += "\n".join(parts)
         return [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": image_content + [{"type": "text", "text": command}],
+                "content": image_content + [{"type": "text", "text": user_text}],
             },
         ]
 

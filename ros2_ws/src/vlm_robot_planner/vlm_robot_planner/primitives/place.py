@@ -63,9 +63,9 @@ class PlacePrimitive(ArmPrimitive):
         place_pose = self._build_release_pose(pose_data)
         pre_place  = self._make_pre_grasp_pose(place_pose, lift_m=_APPROACH_HEIGHT_M)
 
-        # ── 1. Move above target — OMPL (attach still active if set) ──────
+        # ── 1. Move above target — Cartesian approach (OMPL fallback) ────
         self._log(f"  → pre-place (z={pre_place.position.z:.3f})")
-        if not self.move_to_pose(pre_place):
+        if not self.move_to_pose_cartesian(pre_place):
             self._log("pre-place planning failed — aborting place")
             return False
 

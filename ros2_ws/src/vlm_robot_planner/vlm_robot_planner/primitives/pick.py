@@ -74,9 +74,9 @@ class PickPrimitive(ArmPrimitive):
             self._log("open_gripper failed — aborting pick")
             return False
 
-        # ── 2. Pre-grasp (above object) — OMPL free-space approach ────────
+        # ── 2. Pre-grasp (above object) — Cartesian approach (OMPL fallback) ─
         self._log(f"  → moving to pre-grasp (z={pre_grasp.position.z:.3f})")
-        if not self.move_to_pose(pre_grasp):
+        if not self.move_to_pose_cartesian(pre_grasp):
             self._log("pre-grasp planning failed — aborting pick")
             return False
 
