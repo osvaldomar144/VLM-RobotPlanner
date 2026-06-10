@@ -67,9 +67,9 @@ def test_extract_ignores_look_at():
 
 def test_init_assigns_source_location():
     plan = _plan(("pick", {"object": "red_cup"}))
-    init = infer_init_state(plan.steps)
-    assert len(init) == 1
-    obj, loc = init[0]
+    on_pairs, held = infer_init_state(plan.steps)
+    assert len(on_pairs) == 1
+    obj, loc = on_pairs[0]
     assert obj == "red_cup"
     assert "red_cup" in loc   # default: source_red_cup
 
@@ -80,8 +80,8 @@ def test_init_no_duplicates_for_same_object():
         ("place", {"object": "cup", "location": "shelf"}),
         ("pick",  {"object": "cup"}),
     )
-    init = infer_init_state(plan.steps)
-    assert [o for o, _ in init].count("cup") == 1
+    on_pairs, _ = infer_init_state(plan.steps)
+    assert [o for o, _ in on_pairs].count("cup") == 1
 
 
 # ── infer_goal_state ──────────────────────────────────────────────────────────
@@ -91,12 +91,14 @@ def test_goal_from_place():
         ("pick",  {"object": "cup"}),
         ("place", {"object": "cup", "location": "shelf"}),
     )
-    assert ("cup", "shelf") in infer_goal_state(plan.steps)
+    # Returns 3-tuples: ("on", obj, loc)
+    assert ("on", "cup", "shelf") in infer_goal_state(plan.steps)
 
 
 def test_no_goal_if_no_place():
+    # pick-only plan → goal is (holding obj) so the planner doesn't return empty plan
     plan = _plan(("pick", {"object": "cup"}))
-    assert infer_goal_state(plan.steps) == []
+    assert ("holding", "cup") in infer_goal_state(plan.steps)
 
 
 # ── domain template name mapping ──────────────────────────────────────────────

@@ -113,13 +113,26 @@ def _iou(a: list[float], b: list[float]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _nms(boxes: list[list[float]], iou_threshold: float = 0.5) -> list[list[float]]:
+    """Greedy NMS: remove boxes with IoU > threshold against a higher-area box."""
+    if len(boxes) <= 1:
+        return boxes
+    ranked = sorted(boxes, key=lambda b: -(b[2]-b[0])*(b[3]-b[1]))
+    kept: list[list[float]] = []
+    for box in ranked:
+        if not any(_iou(box, k) > iou_threshold for k in kept):
+            kept.append(box)
+    return kept
+
+
 class PerceptionModule:
     """
-    Visual grounding module: maps free-form VLM names to known PDDL names.
+    Visual grounding module: maps free-form VLM names to known PDDL names
+    and estimates 3D object poses for the robot.
 
-    Uses OWL-ViT open-vocabulary detection to find each object in the scene
-    image.  Two objects are considered the same if their detected bounding boxes
-    overlap sufficiently (IoU ≥ IOU_MATCH_THRESHOLD).
+    Uses GroundingDINO for open-vocabulary object detection.
+    GroundingDINO significantly outperforms OWL-ViT on both synthetic
+    (Gazebo) and real (RealSense) images for robotics manipulation tasks.
 
     Usage:
         perception = PerceptionModule()
@@ -129,21 +142,28 @@ class PerceptionModule:
                                                   known_locations=["shelf_b"])
     """
 
-    MODEL_NAME          = "google/owlvit-base-patch32"
-    DETECTION_THRESHOLD = 0.05   # low to maximise recall
+    MODEL_NAME          = "IDEA-Research/grounding-dino-tiny"
+    # GroundingDINO thresholds — lower than typical (0.3) to handle the
+    # domain gap between Gazebo-rendered images and real photos.
+    DETECTION_THRESHOLD = 0.15   # box + text confidence cutoff
     IOU_MATCH_THRESHOLD = 0.05   # min IoU to accept a visual match
 
-    def __init__(self) -> None:
+    def __init__(self, threshold: float | None = None) -> None:
         self._processor = None
         self._model     = None
         self._device    = "cuda" if torch.cuda.is_available() else "cpu"
+        # Allow per-instance threshold override.
+        # Typical values: 0.15 (simulation), 0.20-0.25 (real robot).
+        if threshold is not None:
+            self.DETECTION_THRESHOLD = threshold
+            self.GET_POSE_THRESHOLD  = threshold * 0.67
 
     def load(self) -> None:
-        """Load OWL-ViT weights (much lighter than VLM — ~500 MB)."""
-        from transformers import OwlViTForObjectDetection, OwlViTProcessor
+        """Load GroundingDINO-Tiny weights (~700 MB)."""
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
         print(f"[INFO] Loading PerceptionModule ({self.MODEL_NAME})…")
-        self._processor = OwlViTProcessor.from_pretrained(self.MODEL_NAME)
-        self._model     = OwlViTForObjectDetection.from_pretrained(
+        self._processor = AutoProcessor.from_pretrained(self.MODEL_NAME)
+        self._model     = AutoModelForZeroShotObjectDetection.from_pretrained(
             self.MODEL_NAME
         ).to(self._device)
         self._model.eval()
@@ -408,6 +428,151 @@ class PerceptionModule:
         ]
         return corrected
 
+    # Best GroundingDINO query per PDDL name.
+    # First entry is the primary query used in _detect(); the rest are
+    # Fallback queries used ONLY when no VLM description is available.
+    # In Phase 2+, the natural-language description from the VLM is passed
+    # directly as the GroundingDINO query — no hardcoding needed.
+    # This dict is kept as a last resort for PDDL-name-only calls (e.g. tests).
+    _QUERY_SYNONYMS: dict[str, list[str]] = {}
+
+    GET_POSE_THRESHOLD = 0.10
+
+    def get_pose(
+        self,
+        object_name: str,
+        image: Image.Image,
+        K: np.ndarray,
+        cam_to_base: np.ndarray,
+        obj_z_base: float = 0.025,
+        vlm_description: str | None = None,
+        pre_bbox: list | None = None,
+    ) -> dict | None:
+        """
+        Estimate a 3D object pose in panda_link0 frame via ray-plane intersection.
+
+        The query for GroundingDINO is built as:
+          1. vlm_description if provided (e.g. "the red cup on the table")
+          2. Otherwise: object_name converted to natural language ("red cup")
+          3. Fallback synonyms from _QUERY_SYNONYMS if defined
+
+        Passing vlm_description from the VLM plan avoids any hardcoded mapping
+        and generalises to arbitrary objects without changes to this code.
+
+        Phase 2 (sim): assumes a known table-plane height (obj_z_base) and uses
+        the pinhole camera model to back-project a detected bbox centre to a 3D
+        point on that plane.
+
+        Phase 4 (real robot): replace this with a depth-pixel lookup using the
+        RealSense D435i — get depth at (u, v), deproject with K, then apply
+        cam_to_base.  The bbox detection logic (OWL-ViT) stays identical.
+
+        Returns {"x": …, "y": …, "z": obj_z_base} in panda_link0 frame,
+        or None if the object is not detected or the ray misses the plane.
+
+        pre_bbox: [x1,y1,x2,y2] from VLM output — skips GroundingDINO detection.
+          Use when the VLM has already localised the object in the image (better
+          than GroundingDINO for visually ambiguous tools like hammer vs wrench).
+          Phase 4: same bbox → depth lookup instead of ray-plane intersection.
+        """
+        if self._model is None:
+            raise RuntimeError("Call load() before get_pose()")
+
+        # If the VLM provided a bbox, use it directly — no GroundingDINO needed.
+        # Validation shows GroundingDINO fuses visually similar tools (hammer +
+        # wrench + drill) into one label; the VLM is more reliable for tool ID.
+        if pre_bbox is not None and len(pre_bbox) == 4:
+            x1, y1, x2, y2 = pre_bbox
+            H, W = image.height, image.width
+            x1 = max(0, min(x1, W)); x2 = max(0, min(x2, W))
+            y1 = max(0, min(y1, H)); y2 = max(0, min(y2, H))
+            u = (x1 + x2) / 2.0
+            v = (y1 + y2) / 2.0
+            print(f"[Perception] get_pose '{object_name}': using VLM bbox "
+                  f"[{x1},{y1},{x2},{y2}] → center=({u:.0f},{v:.0f})")
+        else:
+            # GroundingDINO detection path (fallback / place location)
+            readable = object_name.replace("_", " ")
+            synonyms = self._QUERY_SYNONYMS.get(object_name, [])
+            primary  = vlm_description.lower() if vlm_description else readable
+            queries  = list(dict.fromkeys([primary, readable] + synonyms))
+
+            best_score = -1.0
+            best_box   = None
+            for q in queries:
+                readable_q = q.replace("_", " ").lower() + " ."
+                inputs_q = self._processor(
+                    images=image, text=readable_q, return_tensors="pt"
+                ).to(self._device)
+                with torch.no_grad():
+                    out_q = self._model(**inputs_q)
+                H, W = image.height, image.width
+                res = self._processor.post_process_grounded_object_detection(
+                    out_q,
+                    inputs_q.input_ids,
+                    threshold=self.GET_POSE_THRESHOLD,
+                    text_threshold=self.GET_POSE_THRESHOLD * 0.8,
+                    target_sizes=[(H, W)],
+                )[0]
+                for box, score in zip(res["boxes"], res["scores"]):
+                    s = float(score)
+                    if s > best_score:
+                        best_score = s
+                        best_box   = box.tolist()
+
+            if best_box is None:
+                return None
+
+            u = (best_box[0] + best_box[2]) / 2.0
+            v = (best_box[1] + best_box[3]) / 2.0
+            print(f"[Perception] get_pose '{object_name}': GroundingDINO "
+                  f"score={best_score:.3f} → center=({u:.0f},{v:.0f})")
+
+        # Unproject to normalised camera-frame ray
+        K_inv  = np.linalg.inv(K)
+        d_cam  = K_inv @ np.array([u, v, 1.0])
+
+        # Transform ray to panda_link0
+        R      = cam_to_base[:3, :3]
+        t      = cam_to_base[:3, 3]
+        d_base = R @ d_cam
+        norm   = np.linalg.norm(d_base)
+        if norm < 1e-9:
+            return None
+        d_base /= norm
+
+        # Ray–plane intersection at z = obj_z_base
+        if abs(d_base[2]) < 1e-9:
+            return None
+        t_ray = (obj_z_base - t[2]) / d_base[2]
+        if t_ray < 0:
+            return None
+
+        point = t + t_ray * d_base
+        return {"x": float(point[0]), "y": float(point[1]), "z": float(obj_z_base)}
+
+    @staticmethod
+    def load_camera_data(
+        data_dir: str = "/workspace/data",
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Load K (3×3) and cam_to_base (4×4) from camera_info.json / camera_pose.json.
+        Returns (K, cam_to_base) or None if either file is missing.
+        """
+        import json
+        import os
+
+        cam_info_path = os.path.join(data_dir, "camera_info.json")
+        cam_pose_path = os.path.join(data_dir, "camera_pose.json")
+        if not (os.path.exists(cam_info_path) and os.path.exists(cam_pose_path)):
+            return None
+
+        with open(cam_info_path) as f:
+            K = np.array(json.load(f)["K"], dtype=np.float64)
+        with open(cam_pose_path) as f:
+            cam_to_base = np.array(json.load(f)["cam_to_base"], dtype=np.float64)
+        return K, cam_to_base
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _detect(
@@ -417,40 +582,57 @@ class PerceptionModule:
         threshold: Optional[float] = None,
     ) -> dict[str, list[list[float]]]:
         """
-        Run OWL-ViT and return bounding boxes per name.
-        Underscores in names are replaced with spaces for the text query.
+        Run GroundingDINO and return bounding boxes per name.
+
+        GroundingDINO takes a single dot-separated text string and returns
+        bounding boxes with matched phrase labels.  Each detected label is
+        matched back to the input name list via token overlap.
+
         Returns: {name: [[x0, y0, x1, y1], ...]}
         """
         if threshold is None:
             threshold = self.DETECTION_THRESHOLD
 
-        readable = [n.replace("_", " ") for n in names]
-        inputs   = self._processor(
-            text=[readable], images=image, return_tensors="pt"
+        # Convert PDDL names to natural-language queries.
+        # No hardcoded synonyms — GroundingDINO handles arbitrary descriptions.
+        # The VLM's original text (passed via ground_names / get_pose callers)
+        # is already in natural language; PDDL names just need underscore removal.
+        readable = [n.replace("_", " ").lower() for n in names]
+        text = " . ".join(readable) + " ."
+
+        inputs = self._processor(
+            images=image, text=text, return_tensors="pt"
         ).to(self._device)
 
         with torch.no_grad():
             outputs = self._model(**inputs)
 
-        # Version-agnostic post-processing (avoids API differences across
-        # transformers versions — works with any OWL-ViT release).
-        # outputs.logits:    [1, num_patches, num_queries]
-        # outputs.pred_boxes: [1, num_patches, 4]  (cx, cy, w, h, normalised)
-        logits    = outputs.logits[0].cpu()      # [patches, queries]
-        pred_boxes = outputs.pred_boxes[0].cpu() # [patches, 4]
-        W, H = float(image.size[0]), float(image.size[1])
+        H, W = image.height, image.width
+        results = self._processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=threshold,
+            text_threshold=threshold * 0.8,
+            target_sizes=[(H, W)],
+        )[0]
 
         boxes: dict[str, list] = {n: [] for n in names}
-        for q_idx, name in enumerate(names):
-            scores = torch.sigmoid(logits[:, q_idx])
-            for p_idx in (scores >= threshold).nonzero(as_tuple=False).flatten().tolist():
-                cx, cy, w, h = pred_boxes[p_idx].tolist()
-                boxes[name].append([
-                    (cx - w / 2) * W, (cy - h / 2) * H,
-                    (cx + w / 2) * W, (cy + h / 2) * H,
-                ])
 
-        return boxes
+        label_key = "text_labels" if "text_labels" in results else "labels"
+        for box, label in zip(results["boxes"], results[label_key]):
+            x0, y0, x1, y1 = box.tolist()
+            label_tokens = set(label.lower().split())
+            # Match label to the input name with maximum token overlap
+            best_name, best_overlap = None, 0
+            for orig, read in zip(names, readable):
+                overlap = len(label_tokens & set(read.split()))
+                if overlap > best_overlap:
+                    best_overlap, best_name = overlap, orig
+            if best_name:
+                boxes[best_name].append([x0, y0, x1, y1])
+
+        # NMS per object: keep only non-overlapping boxes
+        return {n: _nms(b) for n, b in boxes.items()}
 
     def _best_iou_match(
         self,

@@ -33,8 +33,12 @@ class _WaitNode(Node):
     def __init__(self) -> None:
         super().__init__("_wait_step_complete")
         self.result: dict | None = None
+        # TRANSIENT_LOCAL matches publisher QoS — receives last message even if
+        # published before this subscriber was created (race condition fix).
+        from rclpy.qos import QoSProfile, DurabilityPolicy
+        _latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(
-            String, "/vlm_planner/step_complete", self._on_step, 10
+            String, "/vlm_planner/step_complete", self._on_step, _latched
         )
         self.create_subscription(
             String, "/vlm_planner/status", self._on_status, 10

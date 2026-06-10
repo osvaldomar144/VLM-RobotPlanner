@@ -35,6 +35,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import PoseStamped
 
 # Locate repo root so planner/, vlm/, simulation/ are importable.
 # VLMRP_REPO_ROOT can be set externally; inside Docker the layout is /workspace/<modules>.
@@ -46,8 +47,30 @@ from planner.plan_parser import PrimitiveCall
 from simulation.oracle.world_state import GazeboOracle, GazeboAttach
 
 
-# All Gazebo model names the oracle tracks by default
-_TRACKED_OBJECTS = ["red_cup", "blue_box", "shelf_b", "table"]
+# Phase 2 architecture — who provides poses:
+#
+#  PICK targets   → PerceptionModule (GroundingDINO) after look_at.
+#                   Oracle is BYPASSED when perception cache is fresh.
+#
+#  PLACE locations → known scene positions (oracle or static map).
+#                   In Phase 4 real robot: replaced by a pre-built scene map
+#                   or a second look_at on the target location.
+#
+# _TRACKED_OBJECTS: oracle queries ONLY for place locations and fallback.
+# Kept minimal to avoid querying absent objects.
+_TRACKED_OBJECTS = [
+    # ── workshop place locations ──
+    "target_tray",
+    # ── office place locations ──
+    "side_table",
+    # ── tabletop (Phase 1 compat) ──
+    "shelf_b", "table",
+]
+
+# W4 NOTE: Dynamic collision objects for manipulable scene objects will be
+# provided by an OctoMap built from RealSense point cloud data in Phase 2.
+# No manual collision box management here — that approach is fragile,
+# simulation-specific, and would require replication on the real robot.
 
 
 class Orchestrator(Node):
@@ -77,6 +100,18 @@ class Orchestrator(Node):
             qos_profile=10,
         )
 
+        # ── Phase 2: perception pose cache ────────────────────────────────
+        # Receives poses from PerceptionModule (host) after look_at.
+        # Cache: {object_name: (timestamp_sec, x, y, z)} in panda_link0 frame.
+        # Poses older than _PERCEPTION_TTL_S fall back to GazeboOracle.
+        self._perception_cache: dict[str, tuple[float, float, float, float]] = {}
+        self._perception_sub = self.create_subscription(
+            PoseStamped,
+            "/perception/object_pose",
+            self._on_perception_pose,
+            10,
+        )
+
         # ── Task command subscription ─────────────────────────────────────
         self._cmd_sub = self.create_subscription(
             String,
@@ -95,13 +130,24 @@ class Orchestrator(Node):
             qos_profile=10,
         )
 
+        # ── Collision object publisher (static planning scene only) ──────
+        # Used for: table (startup), AttachedCollisionObject (W5 pick/place).
+        # Dynamic obstacle management (W4) is deferred to Phase 2 (OctoMap).
+        from moveit_msgs.msg import CollisionObject as _CO
+        self._collision_pub = self.create_publisher(_CO, "/collision_object", 10)
+
         # ── Status publisher ──────────────────────────────────────────────
         self._status_pub = self.create_publisher(String, "/vlm_planner/status", 10)
         # ── Step-complete publisher (closed-loop support) ─────────────────
         # Published after every primitive execution.
         # Payload JSON: {"step": <i>, "primitive": "<name>", "success": bool,
         #                "task_complete": bool}
-        self._step_pub = self.create_publisher(String, "/vlm_planner/step_complete", 10)
+        # TRANSIENT_LOCAL: late subscribers receive the last message published.
+        # Prevents race condition where host _wait_step_complete subscribes after
+        # the orchestrator already published the completion signal.
+        from rclpy.qos import QoSProfile, DurabilityPolicy
+        _latched_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._step_pub = self.create_publisher(String, "/vlm_planner/step_complete", _latched_qos)
         self._publish_status("ready — VLM loading in background")
 
         # ── Load VLM weights in background thread ─────────────────────────
@@ -154,7 +200,7 @@ class Orchestrator(Node):
         from shape_msgs.msg import SolidPrimitive
         from geometry_msgs.msg import Pose
 
-        pub = self.create_publisher(CollisionObject, "/collision_object", 10)
+        pub = self._collision_pub   # use shared publisher
 
         co = CollisionObject()
         co.header.frame_id = "panda_link0"
@@ -225,6 +271,25 @@ class Orchestrator(Node):
     def _camera_callback(self, msg: Image) -> None:
         """Store the latest camera frame (thread-safe — overwrite is atomic)."""
         self._latest_image = msg
+
+    def _on_perception_pose(self, msg: PoseStamped) -> None:
+        """Cache a perception-estimated pose (Phase 2).
+        The object name is encoded in msg.header.frame_id."""
+        obj = msg.header.frame_id
+        if not obj:
+            return
+        t = self.get_clock().now().nanoseconds / 1e9
+        self._perception_cache[obj] = (
+            t,
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        )
+        self.get_logger().info(
+            f"[Perception] '{obj}' cached: "
+            f"({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, "
+            f"{msg.pose.position.z:.3f}) panda_link0"
+        )
 
     def _command_callback(self, msg: String) -> None:
         """
@@ -317,7 +382,6 @@ class Orchestrator(Node):
             try:
                 from planner.plan_parser import PrimitiveCall
 
-                world_state = self._oracle.get_world_state(_TRACKED_OBJECTS)
                 primitives  = []
 
                 for step in vlm_plan.steps:
@@ -336,7 +400,7 @@ class Orchestrator(Node):
 
                 for i, prim in enumerate(primitives):
                     self.get_logger().info(f"  [direct] → {prim.name}({prim.args})")
-                    ok = self._dispatch(prim, world_state)
+                    ok = self._dispatch(prim)
                     self._publish_step_complete(i, prim.name, ok,
                                                 task_complete=(i == len(primitives)-1) and ok)
                     if not ok:
@@ -393,14 +457,12 @@ class Orchestrator(Node):
             f"(repair_attempts={result.repair_attempts})"
         )
 
-        # Refresh world state once before dispatch
-        world_state = self._oracle.get_world_state(_TRACKED_OBJECTS)
-
-        # Dispatch each primitive — publish step_complete after each one
+        # Dispatch each primitive — oracle lookup is lazy inside _dispatch
         n = len(result.primitives)
         for i, prim in enumerate(result.primitives):
             self.get_logger().info(f"  → {prim.name}({prim.args})")
-            ok = self._dispatch(prim, world_state)
+
+            ok = self._dispatch(prim)
             is_last = (i == n - 1)
             self._publish_step_complete(i, prim.name, ok, task_complete=is_last and ok)
             if not ok:
@@ -423,7 +485,7 @@ class Orchestrator(Node):
         "place": 1,
     }
 
-    def _dispatch(self, prim: PrimitiveCall, world_state) -> bool:
+    def _dispatch(self, prim: PrimitiveCall) -> bool:
         """Route a PrimitiveCall to the correct handler."""
         handler = self._prim_dispatch.get(prim.name)
         if handler is None:
@@ -434,19 +496,56 @@ class Orchestrator(Node):
         arg_idx  = self._ORACLE_ARG_IDX.get(prim.name, 0)
         obj_name = prim.args[arg_idx] if len(prim.args) > arg_idx else ""
 
+        # ── Pose resolution: perception cache → oracle fallback ─────────
+        # TTL: perception poses are valid for 60 s (one full pick–place cycle).
+        _PERCEPTION_TTL_S = 60.0
+
         pose_data = None
         if obj_name:
-            pose = world_state.get_pose(obj_name)
-            if pose is not None:
-                pose_data = {
-                    "position":    pose.position,
-                    "orientation": pose.orientation,
-                }
+            # Phase 2: prefer PerceptionModule estimate when fresh
+            cached = self._perception_cache.get(obj_name)
+            if cached is not None:
+                t_cached, cx, cy, cz = cached
+                age = self.get_clock().now().nanoseconds / 1e9 - t_cached
+                if age < _PERCEPTION_TTL_S:
+                    from simulation.oracle.world_state import Position, Orientation
+                    pose_data = {
+                        "position":    Position(x=cx, y=cy, z=cz),
+                        "orientation": Orientation(x=0.0, y=0.0, z=0.0, w=1.0),
+                    }
+                    self.get_logger().info(
+                        f"[Perception] Using cached pose for '{obj_name}' "
+                        f"(age {age:.1f}s) — oracle bypassed"
+                    )
+
+            # Oracle fallback — lazy single query (only for needed object)
+            if pose_data is None:
+                pose = self._oracle.get_pose(obj_name)
+                if pose is not None:
+                    pose_data = {
+                        "position":    pose.position,
+                        "orientation": pose.orientation,
+                    }
+                else:
+                    self.get_logger().warn(
+                        f"Oracle: no pose for '{obj_name}' — "
+                        "primitive will use None pose."
+                    )
+
+        # For pick: pass the support surface so attach_object() adds it to
+        # touch_links (standard MoveIt2 pick-from-surface pattern).
+        # Source comes from prim.args[1] (PDDL planner always fills it):
+        #   - "source_<obj>"   → auto-generated name → object is on the table
+        #   - "shelf_b", etc.  → explicit PDDL location → use as-is
+        # On the real robot the same logic applies: MoveIt2 collision object
+        # names match the PDDL location names set up in the planning scene.
+        if prim.name == "pick" and obj_name:
+            raw_source = prim.args[1] if len(prim.args) > 1 else None
+            if raw_source and raw_source.startswith("source_"):
+                surface = "table"
             else:
-                self.get_logger().warn(
-                    f"Oracle: no pose for '{obj_name}' — "
-                    "primitive will use None pose."
-                )
+                surface = raw_source   # e.g. "shelf_b", None for unknown
+            return handler(obj_name, pose_data, support_surface=surface)
 
         return handler(obj_name, pose_data)
 

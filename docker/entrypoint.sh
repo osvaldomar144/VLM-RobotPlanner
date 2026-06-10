@@ -8,6 +8,11 @@ if [ -f /opt/gcr2c_ws/install/setup.bash ]; then
     source /opt/gcr2c_ws/install/setup.bash
 fi
 
+# Boeing gazebo_model_attachment_plugin (physics-based object grasping)
+if [ -f /opt/boeing_ws/install/setup.bash ]; then
+    source /opt/boeing_ws/install/setup.bash
+fi
+
 # Rebuild the Python package so entry point scripts are always current.
 # ament_python packages have no C++ — this takes ~2s.
 if [ -d /workspace/ros2_ws/src ]; then

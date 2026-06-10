@@ -19,11 +19,19 @@ from rclpy.node import Node
 from vlm_robot_planner.primitives.base import ArmPrimitive, _TOP_DOWN_QUAT
 
 # Height of panda_hand above the target surface centre at the release pose.
-# shelf_b top at z≈0.02 m (panda_link0) → cup bottom must clear this.
-# With _RELEASE_HEIGHT_M = 0.18 and shelf centre z=0.01:
-#   panda_hand z = 0.19 m → cup center z = 0.09 m → cup bottom = 0.03 m
-#   Cup bottom (0.03 m) > shelf top (0.02 m) → 1 cm gap, falls gently ✓
-_RELEASE_HEIGHT_M  = 0.18
+# With two-finger Boeing joints, cup follows panda_hand at the same
+# _GRASP_OFFSET_Z_M (0.13 m) captured during pick.
+#
+# Geometry (panda_link0 reference, table surface = z=0.00 m):
+#   cup_z       = panda_hand_z − 0.13
+#   cup_bottom  = cup_z − 0.06
+#   shelf top   = shelf_centre_z + 0.01 = 0.01 + 0.01 = 0.02 m
+#
+# _RELEASE_HEIGHT_M = 0.22: panda_hand at 0.23 m → cup bottom at 0.04 m
+#   → 2 cm above shelf top ✓
+#   ACO bottom at 0.23−0.13−0.07 = 0.03 m > table top 0.00 m ✓
+# Cup falls ~2 cm onto shelf after Boeing detach.
+_RELEASE_HEIGHT_M  = 0.22
 # Approach height above the release pose (pre-place clearance)
 _APPROACH_HEIGHT_M = 0.15
 
@@ -60,6 +68,15 @@ class PlacePrimitive(ArmPrimitive):
         pos = pose_data["position"]
         self._log(f"place('{location_name}'): pos=({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
 
+        # Sanity-check oracle coordinates: Panda workspace is ≤ 0.85 m from base.
+        # Values outside ±2 m indicate a corrupted Gazebo state (physics explosion).
+        if abs(pos.x) > 2.0 or abs(pos.y) > 2.0 or abs(pos.z) > 2.0:
+            self._log(
+                f"place('{location_name}'): oracle pose outside workspace "
+                f"({pos.x:.1f}, {pos.y:.1f}, {pos.z:.1f}) — Gazebo state corrupted, aborting"
+            )
+            return False
+
         place_pose = self._build_release_pose(pose_data)
         pre_place  = self._make_pre_grasp_pose(place_pose, lift_m=_APPROACH_HEIGHT_M)
 
@@ -75,13 +92,21 @@ class PlacePrimitive(ArmPrimitive):
             self._log("place descend failed — aborting place")
             return False
 
-        # ── 3. Open gripper (release object) ──────────────────────────────
-        if not self.open_gripper():
-            self._log("open_gripper failed during place — object may not be released")
+        # ── 3. Release: Boeing detach → ACO detach → open gripper ────────
+        # ORDER MATTERS with two-finger Boeing joints:
+        # detach BEFORE open_gripper so the fingers don't drag the cup
+        # sideways as they open (both fingers are rigidly linked to cup).
 
-        # ── 3b. Detach simulated object — Gazebo physics drops it ~1 cm ──
+        # 3a. Simulation-only: release physics joints first
         if self._attach is not None:
             self._attach.detach()
+
+        # 3b. Notify MoveIt2 that the object is released (W5)
+        self.detach_object()
+
+        # 3c. Open gripper — fingers now free, cup already falling
+        if not self.open_gripper():
+            self._log("open_gripper failed during place — object may not be released")
 
         # ── 4. Retreat upward — PILZ LIN ──────────────────────────────────
         self._log("  → retreating")
@@ -89,7 +114,12 @@ class PlacePrimitive(ArmPrimitive):
             self._log("retreat after place failed")
             return False
 
-        # ── 5. Return to ready pose (PILZ PTP joint-space) ────────────────
+        # ── 5. Safe retreat → ready (two-step return) ─────────────────────
+        # Go through "safe_retreat" first (arm high above table) to avoid
+        # PILZ PTP paths that could dip near table-level objects.
+        # Falls back to direct "ready" if safe_retreat is unreachable.
+        if not self.move_to_named("safe_retreat"):
+            self._log("safe_retreat unreachable — returning directly to ready")
         self.move_to_named("ready")
 
         self._log(f"place('{location_name}'): SUCCESS")

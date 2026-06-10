@@ -29,11 +29,14 @@ from vlm_robot_planner.primitives.base import ArmPrimitive, _TOP_DOWN_QUAT
 _APPROACH_HEIGHT_M = 0.15
 
 # Height of panda_hand above the object centre at the grasp pose.
-# Franka finger length below panda_hand frame ≈ 0.13 m (58 mm joint offset + 75 mm finger).
-# With _GRASP_OFFSET_Z_M = 0.10 and red_cup centre at z=0.06 m:
-#   panda_hand z = 0.16 m → finger tips z ≈ 0.03 m (safely above table surface at z=0.00)
-#   pre-grasp z = 0.31 m (matches smoke-test goal)
-_GRASP_OFFSET_Z_M = 0.10
+# Franka finger length below panda_hand frame ≈ 0.133 m (58 mm joint offset + 75 mm finger).
+# panda_hand palm housing extends ~58 mm in +Z (toward fingertips) before the finger joints.
+# With _GRASP_OFFSET_Z_M = 0.13 and red_cup centre at z=0.83 m (world):
+#   panda_hand z = 0.96 m → palm housing bottom ≈ 0.902 m (above cup top at 0.89 m) ✓
+#   finger tips z ≈ 0.827 m ≈ cup centre — good grasp position
+#   pre-grasp z = 0.96 + 0.15 = 1.11 m (above any table object)
+# On real robot this also ensures the palm never contacts the object top.
+_GRASP_OFFSET_Z_M = 0.13
 
 
 class PickPrimitive(ArmPrimitive):
@@ -51,14 +54,23 @@ class PickPrimitive(ArmPrimitive):
         super().__init__(node, moveit)
         self._attach = attach
 
-    def execute(self, object_name: str, pose_data: dict) -> bool:
+    def execute(
+        self,
+        object_name: str,
+        pose_data: dict,
+        support_surface: str | None = None,
+    ) -> bool:
         """
         Execute a top-down pick on the named object.
 
         Args:
-            object_name: Symbolic object name (for logging).
-            pose_data:   Pose dict from GazeboOracle:
-                         {"position": Position, "orientation": Orientation}
+            object_name:     Symbolic object name (for logging).
+            pose_data:       Pose dict from GazeboOracle.
+            support_surface: MoveIt2 collision object name of the surface the
+                             item rests on (e.g. "table", "shelf_b").
+                             Passed to attach_object() as touch_link so MoveIt2
+                             allows the initial ACO-surface overlap during lift.
+                             Identical pattern on real robot.
 
         Returns:
             True if the full pick sequence completed successfully.
@@ -68,6 +80,15 @@ class PickPrimitive(ArmPrimitive):
 
         grasp_pose = self._build_top_down_pose(pose_data)
         pre_grasp  = self._make_pre_grasp_pose(grasp_pose, lift_m=_APPROACH_HEIGHT_M)
+
+        # ── 0. Clean up stale state from previous incomplete operations ──────
+        # Covers two failure modes:
+        #   a) ACO left attached in MoveIt2 (blocks collision planning)
+        #   b) GazeboAttach timer still running (object keeps teleporting)
+        # Both are silent — the robot appears fine but the next pick fails.
+        self.detach_object()
+        if self._attach is not None:
+            self._attach.detach()   # stops 100 Hz teleport timer if still running
 
         # ── 1. Open gripper ────────────────────────────────────────────────
         if not self.open_gripper():
@@ -90,7 +111,11 @@ class PickPrimitive(ArmPrimitive):
         if not self.close_gripper():
             self._log("close_gripper failed — object may have slipped")
 
-        # ── 4b. Start simulated attachment ─────────────────────────────────
+        # ── 4b. Notify MoveIt2 that the object is now held (W5) ───────────
+        # Pass support_surface so MoveIt2 allows ACO-surface overlap during lift.
+        self.attach_object(object_name, support_surface=support_surface)
+
+        # ── 4c. Simulation-only: physics joint attachment (Boeing plugin) ─
         if self._attach is not None:
             self._attach.attach(object_name, grasp_offset_z=_GRASP_OFFSET_Z_M)
 
@@ -98,6 +123,7 @@ class PickPrimitive(ArmPrimitive):
         self._log("  → lifting object")
         if not self.move_to_pose_linear(pre_grasp):
             self._log("lift failed — object may be stuck")
+            self.detach_object(object_name)
             if self._attach is not None:
                 self._attach.detach()
             return False

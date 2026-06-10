@@ -1,60 +1,67 @@
 """
-'look_at' primitive: orient the wrist camera toward a target object.
+look_at — Phase 2: DINO-based directional observation.
 
-Phase 1 implementation: moves the arm to a fixed "observation" configuration
-that places the eye-in-hand camera above and in front of the robot workspace,
-looking down at the table. Full per-object camera pointing (computing IK for
-camera-on-target) is a Phase 2 task once hand-eye calibration is done.
+Flow:
+  1. run_loop_host.py runs DINO on scan image → publishes pose to /perception/object_pose
+  2. Orchestrator _dispatch checks perception cache → passes pose_data to execute()
+  3. execute() uses pose_data.position to compute j0 = atan2(y, x) → rotates toward object
+  4. Fallback: scan pose (j0=0) if no pose available
 
-The PDDL action is look-at (?i - item), called before pick to ensure
-the camera has a clear view of the object before grasping.
+Oracle-free: pose comes from GroundingDINO, not oracle.
+Phase 4 (real robot): same flow, RealSense depth for z.
 """
 
 from __future__ import annotations
 
-from rclpy.node import Node
+import math
 
+from rclpy.node import Node
 from vlm_robot_planner.primitives.base import ArmPrimitive
 
-
-# Named SRDF configuration that places the arm in an observation pose.
-# This is the "ready" pose from moveit_resources_panda_moveit_config SRDF,
-# which is defined as: [0, -π/4, 0, -3π/4, 0, π/2, π/4] (radians).
-# It positions the camera to look down at the table from ~0.5 m above.
-_OBSERVATION_CONFIG = "scan"
+_TABLE_VIEW_JOINTS = [0.0, -0.70, 0.0, -2.10, 0.0, 1.40, 0.7854]
+_J0_MAX = 1.30   # ±75° clamp
 
 
 class LookAtPrimitive(ArmPrimitive):
-    """
-    Moves the arm to the observation configuration so the wrist camera
-    has a clear view of the table workspace.
-
-    Phase 1: fixed observation pose regardless of target object.
-    Phase 2: compute IK so camera_optical_frame is aligned with target
-             (requires hand-eye calibration with the RealSense D435i).
-    """
 
     def __init__(self, node: Node, moveit) -> None:
         super().__init__(node, moveit)
 
     def execute(self, target_name: str, pose_data: dict | None = None) -> bool:
         """
-        Move arm to observation pose.
-
-        Args:
-            target_name: Name of the object to look at (used for logging;
-                         Phase 2 will use this to compute camera pointing).
-            pose_data:   Object pose (unused in Phase 1).
-
-        Returns:
-            True on success.
+        Move arm toward target using DINO-estimated pose_data.
+        Falls back to scan pose (j0=0) when pose unavailable.
         """
+        if pose_data is None:
+            self._log(f"look_at('{target_name}'): no pose — scan pose fallback")
+            return self.move_to_named("scan")
+
+        pos = pose_data["position"]
+        j0  = math.atan2(pos.y, pos.x)
+        j0  = max(-_J0_MAX, min(_J0_MAX, j0))
+
+        joints    = list(_TABLE_VIEW_JOINTS)
+        joints[0] = j0
+
         self._log(
-            f"look_at('{target_name}'): moving to observation pose '{_OBSERVATION_CONFIG}'"
+            f"look_at('{target_name}'): DINO pose "
+            f"({pos.x:.3f},{pos.y:.3f}) → j0={math.degrees(j0):.1f}°"
         )
-        success = self.move_to_named(_OBSERVATION_CONFIG)
-        if success:
-            self._log(f"look_at('{target_name}'): camera positioned — ready for perception")
-        else:
-            self._log(f"look_at('{target_name}'): failed to reach observation pose")
-        return success
+
+        self._moveit2.move_to_configuration(joints)
+        ok = self._moveit2.wait_until_executed(timeout=15.0)
+        if not ok:
+            self._log(f"  → j0 rotation failed, fallback scan pose")
+            ok = self.move_to_named("scan")
+
+        if ok:
+            self._log(f"look_at('{target_name}'): camera aimed at target area")
+        return ok
+
+        # ── Phase 4: move directly above object (RealSense depth required) ──
+        # obs = Pose()
+        # obs.position.x = pos.x; obs.position.y = pos.y
+        # obs.position.z = pos.z + 0.35
+        # obs.orientation = _TOP_DOWN_QUAT
+        # return self.move_to_pose_linear(obs) or self.move_to_named("scan")
+        # ─────────────────────────────────────────────────────────────────────

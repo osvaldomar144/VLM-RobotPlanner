@@ -89,6 +89,21 @@ RUN bash -c "\
       --packages-select gazebo_ros2_control \
       --event-handlers console_direct+"
 
+# Boeing gazebo_model_attachment_plugin — physics-based object grasping.
+# Replaces the teleport-based GazeboAttach (which oscillates due to ODE gravity
+# fighting kinematic updates). Creates a real Gazebo fixed joint at grasp time.
+RUN bash -c "\
+    source /opt/ros/humble/setup.bash && \
+    git clone --branch humble --depth 1 \
+      https://github.com/Boeing/gazebo_model_attachment_plugin.git \
+      /opt/boeing_ws/src/gazebo_model_attachment_plugin && \
+    cd /opt/boeing_ws && \
+    rosdep install --from-paths src --ignore-src -r -y && \
+    colcon build \
+      --symlink-install \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release \
+      --event-handlers console_direct+"
+
 # Fast Downward PDDL planner — build from source (takes ~2-3 min)
 RUN git clone --depth 1 https://github.com/aibasel/downward.git /opt/fast-downward \
  && cd /opt/fast-downward && python3 build.py \
@@ -117,6 +132,7 @@ COPY scripts/  scripts/
 # guard it with [ -f ] to avoid errors if it doesn't exist yet.
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc \
  && echo "[ -f /opt/gcr2c_ws/install/setup.bash ] && source /opt/gcr2c_ws/install/setup.bash" >> /root/.bashrc \
+ && echo "[ -f /opt/boeing_ws/install/setup.bash ] && source /opt/boeing_ws/install/setup.bash" >> /root/.bashrc \
  && echo "[ -f /workspace/ros2_ws/install/setup.bash ] && source /workspace/ros2_ws/install/setup.bash" >> /root/.bashrc
 
 # Entrypoint sources both ROS 2 overlays

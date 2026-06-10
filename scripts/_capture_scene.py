@@ -18,6 +18,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 
@@ -28,16 +29,19 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image
+import tf2_ros
 
-_OUTPUT_PATH  = "/workspace/data/scene.png"
-_TIMEOUT_SEC  = 8.0
+_OUTPUT_PATH       = "/workspace/data/scene.png"
+_CAM_INFO_PATH     = "/workspace/data/camera_info.json"
+_CAM_POSE_PATH     = "/workspace/data/camera_pose.json"
+_TIMEOUT_SEC       = 8.0
+_TF_RETRIES        = 5
+_TF_RETRY_SLEEP    = 0.3
 
 # Primary: wrist camera (eye-in-hand) — matches real robot deployment.
-# Note: in Gazebo the wrist camera plugin publishes on /wrist_camera/image_raw,
-# NOT /camera/color/image_raw (which is listed in DDS but has no publisher).
-# Arm must be in "scan" pose before calling this script (see _pre_scan.py).
-# Fallback: overview camera (when scan pose not reachable or wrist cam offline).
+# Fallback: overview camera (fixed, when wrist cam offline or scan pose unreachable).
 _TOPICS = [
     "/wrist_camera/image_raw",
     "/overview_camera/image_raw",
@@ -53,6 +57,16 @@ _ENCODINGS = {
     "bgra8":  (4, np.uint8,  True),
     "mono8":  (1, np.uint8,  False),
 }
+
+
+def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Quaternion (x, y, z, w) -> 3×3 rotation matrix (no scipy)."""
+    x2, y2, z2 = x*x, y*y, z*z
+    return np.array([
+        [1 - 2*(y2 + z2),   2*(x*y - z*w),   2*(x*z + y*w)],
+        [2*(x*y + z*w),     1 - 2*(x2 + z2), 2*(y*z - x*w)],
+        [2*(x*z - y*w),     2*(y*z + x*w),   1 - 2*(x2 + y2)],
+    ])
 
 
 def _ros_image_to_pil(msg: Image) -> PilImage.Image:
@@ -79,6 +93,9 @@ class _CaptureNode(Node):
         self.saved            = False
         self._primary         = _TOPICS[0]
         self._primary_deadline = time.time() + _PRIMARY_TOPIC_TIMEOUT
+        self._K: np.ndarray | None = None
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         for topic in _TOPICS:
             self.create_subscription(
@@ -87,6 +104,53 @@ class _CaptureNode(Node):
                 qos_profile_sensor_data,   # BEST_EFFORT — compatible with all Gazebo camera plugins
             )
             self.get_logger().info(f"Listening on {topic}")
+
+        self.create_subscription(
+            CameraInfo, "/wrist_camera/camera_info",
+            self._cam_info_cb,
+            qos_profile_sensor_data,
+        )
+
+    def _cam_info_cb(self, msg: CameraInfo) -> None:
+        if self._K is not None:
+            return
+        k = msg.k  # row-major 3×3
+        self._K = np.array([
+            [k[0], k[1], k[2]],
+            [k[3], k[4], k[5]],
+            [k[6], k[7], k[8]],
+        ])
+        data = {
+            "K": self._K.tolist(),
+            "width": msg.width,
+            "height": msg.height,
+        }
+        with open(_CAM_INFO_PATH, "w") as f:
+            json.dump(data, f)
+        print(f"[OK] Camera info saved: {_CAM_INFO_PATH}")
+
+    def _save_camera_pose(self) -> None:
+        for attempt in range(_TF_RETRIES):
+            try:
+                tf = self._tf_buffer.lookup_transform(
+                    "panda_link0", "wrist_camera_optical_frame", Time()
+                )
+                tr = tf.transform.translation
+                q  = tf.transform.rotation
+                R  = _quat_to_matrix(q.x, q.y, q.z, q.w)
+                mat = np.eye(4)
+                mat[:3, :3] = R
+                mat[:3,  3] = [tr.x, tr.y, tr.z]
+                with open(_CAM_POSE_PATH, "w") as f:
+                    json.dump({"cam_to_base": mat.tolist()}, f)
+                print(f"[OK] Camera pose saved: {_CAM_POSE_PATH}")
+                return
+            except Exception as exc:
+                if attempt < _TF_RETRIES - 1:
+                    time.sleep(_TF_RETRY_SLEEP)
+                else:
+                    print(f"[WARN] TF lookup failed after {_TF_RETRIES} attempts: {exc}",
+                          file=sys.stderr)
 
     def _cb(self, msg: Image, topic: str) -> None:
         if self.saved:
@@ -102,6 +166,7 @@ class _CaptureNode(Node):
             label = "primary" if topic == self._primary else "fallback"
             print(f"[OK] Scene saved: {_OUTPUT_PATH} ({img.width}×{img.height}) "
                   f"[{label}: {topic}]")
+            self._save_camera_pose()
         except Exception as exc:
             print(f"[ERROR] Failed to save image: {exc}", file=sys.stderr)
             sys.exit(1)

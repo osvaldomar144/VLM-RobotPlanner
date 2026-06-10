@@ -1,0 +1,367 @@
+<?xml version="1.0"?>
+<!--
+  Workshop — officina meccanica.
+  STRATEGIA OGGETTI: mesh visual (aspetto realistico) + collision primitiva
+  (cilindro/box: caricamento istantaneo, fisica stabile).
+  Standard usato in Fetch manipulation, PR2 tutorials, YCB object suite.
+  Table surface: z=0.770m.
+-->
+<sdf version="1.6">
+  <world name="workshop">
+
+    <include><uri>model://sun</uri></include>
+    <include><uri>model://ground_plane</uri></include>
+
+    <!-- ── Boeing model attachment plugin ──────────────────────────────────
+         Creates/destroys physics joints between model links via ROS2 services:
+           /gazebo/attach  — create fixed joint (replace GazeboAttach teleport)
+           /gazebo/detach  — remove joint
+         Eliminates oscillation caused by gravity vs. kinematic update conflict.
+    ────────────────────────────────────────────────────────────────────── -->
+    <plugin name="model_attachment"
+            filename="libboeing_gazebo_model_attachment_plugin_lib.so">
+    </plugin>
+
+    <!-- ── Gazebo ROS state plugin ──────────────────────────────────────────
+         Exposes /gazebo/get_entity_state service.
+         Used by GazeboOracle to query ground-truth object poses at runtime.
+    ────────────────────────────────────────────────────────────────────── -->
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/gazebo</namespace>
+      </ros>
+      <update_rate>10.0</update_rate>
+    </plugin>
+
+    <!-- ── Physics (reduce solver iterations for faster sim) ────────────── -->
+    <physics name="default" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>50</iters>
+          <sor>1.3</sor>
+        </solver>
+      </ode>
+    </physics>
+
+    <!-- ── Pavimento cemento ─────────────────────────────────────────────── -->
+    <model name="floor"><static>true</static><pose>0.5 0 0.001 0 0 0</pose>
+      <link name="s"><visual name="v"><geometry><box><size>14 14 0.002</size></box></geometry>
+        <material><ambient>0.30 0.28 0.26 1</ambient><diffuse>0.36 0.33 0.30 1</diffuse></material>
+      </visual></link></model>
+
+    <!-- ── Bancone quercia scura, 120×75cm, top z=0.770m ────────────────── -->
+    <model name="table"><static>true</static><pose>0.5 0.0 0.0 0 0 0</pose>
+      <link name="top"><pose>0 0 0.74 0 0 0</pose>
+        <collision name="col"><geometry><box><size>1.20 0.75 0.06</size></box></geometry>
+          <surface><friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction></surface></collision>
+        <visual name="vis"><geometry><box><size>1.20 0.75 0.06</size></box></geometry>
+          <material><ambient>0.28 0.18 0.10 1</ambient><diffuse>0.38 0.24 0.14 1</diffuse>
+          <specular>0.12 0.08 0.04 1</specular></material></visual>
+      </link>
+      <link name="lfl"><pose> 0.55  0.32 0.37 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.08 0.08 0.74</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.08 0.08 0.74</size></box></geometry>
+          <material><ambient>0.22 0.14 0.08 1</ambient><diffuse>0.30 0.18 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="lfr"><pose> 0.55 -0.32 0.37 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.08 0.08 0.74</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.08 0.08 0.74</size></box></geometry>
+          <material><ambient>0.22 0.14 0.08 1</ambient><diffuse>0.30 0.18 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="lbl"><pose>-0.55  0.32 0.37 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.08 0.08 0.74</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.08 0.08 0.74</size></box></geometry>
+          <material><ambient>0.22 0.14 0.08 1</ambient><diffuse>0.30 0.18 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="lbr"><pose>-0.55 -0.32 0.37 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.08 0.08 0.74</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.08 0.08 0.74</size></box></geometry>
+          <material><ambient>0.22 0.14 0.08 1</ambient><diffuse>0.30 0.18 0.10 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- ── 3 pareti officina, stanza 8×6m h=3m ──────────────────────────── -->
+    <model name="room"><static>true</static><pose>0.5 0 0 0 0 0</pose>
+      <link name="back"><pose>-3.2 0 1.5 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.08 7.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.08 7.0 3.0</size></box></geometry>
+          <material><ambient>0.22 0.20 0.18 1</ambient><diffuse>0.28 0.25 0.22 1</diffuse></material></visual>
+      </link>
+      <link name="left"><pose>-0.2  3.4 1.5 0 0 0</pose>
+        <collision name="c"><geometry><box><size>7.2 0.08 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>7.2 0.08 3.0</size></box></geometry>
+          <material><ambient>0.20 0.18 0.16 1</ambient><diffuse>0.26 0.23 0.20 1</diffuse></material></visual>
+      </link>
+      <link name="right"><pose>-0.2 -3.4 1.5 0 0 0</pose>
+        <collision name="c"><geometry><box><size>7.2 0.08 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>7.2 0.08 3.0</size></box></geometry>
+          <material><ambient>0.20 0.18 0.16 1</ambient><diffuse>0.26 0.23 0.20 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- ── Arredo (static) ───────────────────────────────────────────────── -->
+    <model name="cabinet"><static>true</static><pose>-0.2669 3.0451 0 0 0 -1.5469</pose>
+      <link name="b"><pose>0 0 0.65 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.60 0.40 1.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.60 0.40 1.30</size></box></geometry>
+          <material><ambient>0.28 0.28 0.32 1</ambient><diffuse>0.35 0.35 0.40 1</diffuse>
+          <specular>0.5 0.5 0.5 1</specular></material></visual>
+      </link>
+      <link name="d1"><pose>0.31 0 0.92 0 0 0</pose><visual name="v"><geometry><box><size>0.02 0.36 0.16</size></box></geometry><material><ambient>0.20 0.20 0.23 1</ambient><diffuse>0.25 0.25 0.28 1</diffuse></material></visual></link>
+      <link name="d2"><pose>0.31 0 0.72 0 0 0</pose><visual name="v"><geometry><box><size>0.02 0.36 0.16</size></box></geometry><material><ambient>0.20 0.20 0.23 1</ambient><diffuse>0.25 0.25 0.28 1</diffuse></material></visual></link>
+      <link name="d3"><pose>0.31 0 0.52 0 0 0</pose><visual name="v"><geometry><box><size>0.02 0.36 0.16</size></box></geometry><material><ambient>0.20 0.20 0.23 1</ambient><diffuse>0.25 0.25 0.28 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- ════ OGGETTI IBRIDI: VISUAL=mesh 3D + COLLISION=primitiva ═══════════
+         Standard manipulation benchmark: aspetto realistico + fisica stabile.
+         Nessun mesh per la collision → caricamento ~13s, nessun crash.
+    ════════════════════════════════════════════════════════════════════════ -->
+
+    <!-- ── TRAPANO (cordless_drill) ──────────────────────────────────────────
+         Visual: mesh DAE realistica dal modello Gazebo DB.
+         Collision: cilindro approssimato r=4cm h=22cm (corpo trapano).
+         Posizione calcolata:
+           model_root_z=0.635 → collision_bottom=0.635+0.10-0.10=0.635? No:
+           cyl centre at pose(0,0,0.11) → bottom=0.635+0.11-0.11=0.635? No.
+           Collision cyl centre at z=0.635+0.11=0.745... 
+           SIMPLER: model at z=0.770, collision at z=0.11 → bottom=0.770+0.11-0.11=0.770 ✓
+           Visual at z=0.043-0.770=... too complex. Use visual at z=-0.727 to align.
+           EASIER: model_z=0.635 (calculated), collision poses relative to model root.
+             cyl bottom: z=0.635+0 → need centre at z=0.635+0.11=0.746
+             mesh bottom: 0.635+0.133-0.090+0.092 = 0.770 ✓
+    ─────────────────────────────────────────────────────────────────────── -->
+    <model name="cordless_drill">
+      <!-- model_z=0.635: mesh bottom = 0.635+0.133-0.090+0.092 = 0.770 (table surface) -->
+      <pose>0.55 0.22 0.635 0 0 0</pose>
+      <link name="link">
+        <inertial>
+          <!-- Approximazione cilindro: mass=0.5kg, r=0.04m, h=0.22m -->
+          <mass>0.50</mass>
+          <pose>0 0 0.245 0 0 0</pose>
+          <inertia>
+            <ixx>0.00224</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>0.00224</iyy><iyz>0</iyz>
+            <izz>0.00040</izz>
+          </inertia>
+        </inertial>
+        <!-- Collision: cilindro semplice — bottom a z=0.770 -->
+        <collision name="col">
+          <pose>0 0 0.245 0 0 0</pose>
+          <geometry><cylinder><radius>0.040</radius><length>0.220</length></cylinder></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+        </collision>
+        <!-- Visual: mesh DAE realistica — il robot si assesta ora (fix IPC in start_sim.sh) -->
+        <visual name="vis">
+          <pose>-0.006 -0.008 0.043 0 0 0</pose>
+          <geometry>
+            <mesh><uri>model://cordless_drill/meshes/cordless_drill.dae</uri></mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── CHIAVE INGLESE (monkey_wrench) — sul bancone, graspabile ─────────
+         DAE in inches (0.0254m/unit). z_bottom=-1inch=-0.0254m dal root.
+         model_z = 0.770 + 0.0254 = 0.7954 → bottom esattamente a 0.770m.
+         Collision: cilindro r=3cm h=17.8cm (corpo chiave), centre a 6.4cm dal root.
+    ─────────────────────────────────────────────────────────────────────── -->
+    <model name="monkey_wrench">
+      <pose>0.55 -0.1335 0.7954 0 0 1.5708</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.35</mass>
+          <pose>0 0 0.064 0 0 0</pose>
+          <inertia><ixx>9.8e-4</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>9.8e-4</iyy><iyz>0</iyz><izz>1.6e-4</izz></inertia>
+        </inertial>
+        <collision name="col">
+          <pose>0 0 0.064 0 0 0</pose>
+          <geometry><cylinder><radius>0.030</radius><length>0.178</length></cylinder></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+        </collision>
+        <!-- visual mesh realistica DAE -->
+        <visual name="vis">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry>
+            <mesh><uri>model://monkey_wrench/meshes/monkey_wrench.dae</uri></mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── MARTELLO (hammer) — sul bancone, graspabile ──────────────────────
+         DAE in inches. z_bottom=-1inch=-0.0254m → model_z=0.7954m.
+         Collision: box piatto (martello coricato) 30×4×5cm,
+         centre_z=-0.0254+0.025=-0.0004≈0 → bottom al livello tavolo. -->
+    <model name="hammer">
+      <pose>0.75 0.0171 0.7954 0 0 0</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.45</mass>
+          <pose>0 0 0 0 0 0</pose>
+          <inertia><ixx>3.4e-4</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>3.5e-3</iyy><iyz>0</iyz><izz>3.5e-3</izz></inertia>
+        </inertial>
+        <collision name="col">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry><box><size>0.300 0.040 0.050</size></box></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+        </collision>
+        <!-- Manico: cilindro marrone scuro, r=1.5cm, l=24cm, giace su x -->
+        <visual name="handle">
+          <pose>0 0 0 0 1.5708 0</pose>
+          <geometry><cylinder><radius>0.015</radius><length>0.240</length></cylinder></geometry>
+          <material><ambient>0.35 0.20 0.08 1</ambient><diffuse>0.45 0.26 0.10 1</diffuse></material>
+        </visual>
+        <!-- Testa: box acciaio scuro 7×4×4cm, all'estremità del manico -->
+        <visual name="head">
+          <pose>0.10 0 0 0 0 0</pose>
+          <geometry><box><size>0.070 0.040 0.040</size></box></geometry>
+          <material><ambient>0.25 0.25 0.28 1</ambient><diffuse>0.35 0.35 0.38 1</diffuse>
+          <specular>0.6 0.6 0.6 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Lattina cola (testata, z=0.772) — >20cm da ogni altro oggetto -->
+    <include><uri>model://coke_can</uri><name>coke_can</name>
+      <pose>0.72 -0.26 0.772 0 0 0</pose></include>
+
+    <!-- Sfera gauge (cricket_ball, testata, z=0.810) -->
+    <include><uri>model://cricket_ball</uri><name>gauge_ball</name>
+      <pose>0.8477 0.22 0.810 0 0 0</pose></include>
+
+    <!-- ── Target: vassoio deposito giallo (static) ──────────────────────── -->
+    <model name="target_tray"><static>true</static>
+      <pose>0.87 -0.1717 0.780 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.120 0.120 0.020</size></box></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface></collision>
+        <visual name="vis"><geometry><box><size>0.120 0.120 0.020</size></box></geometry>
+          <material><ambient>0.90 0.75 0.05 1</ambient><diffuse>0.95 0.85 0.06 1</diffuse></material></visual>
+      </link>
+    </model>
+
+
+    <!-- toolbox posizionato manualmente sopra wall_shelf -->
+    <include>
+      <uri>model://toolbox_metal</uri>
+      <name>toolbox</name>
+      <pose>-2.2432 2.2644 0.8146 0 0 0</pose>
+    </include>
+
+    <!-- ── Overview camera: fixed, 3/4 frontal-lateral view of the table ──────
+         Position: world (1.0, 0.7, 1.5) — to the right of and slightly past
+         the table's far edge, elevated.
+         Orientation: rpy = (0, 0.68, -2.19) — looks toward table centre
+         (0.5, 0, 0.8).  Optical-axis formula: (cos(yaw)*cos(pitch),
+         sin(yaw)*cos(pitch), -sin(pitch)) → (-0.45, -0.63, -0.63) ✓
+
+         Why this position vs straight-down:
+           - Objects in foreground (x≈0.5), arm base in background (x≈0.2)
+             → arm never occludes objects regardless of joint config.
+           - y=0.7 offset puts arm (y≈0) to the left of frame centre,
+             objects (y=-0.25…+0.10) in right-centre → spatially separated.
+           - 3/4 perspective gives VLM better depth/layout understanding
+             than pure top-down view.
+
+         Phase 2+: replace with eye-in-hand RealSense D435i after look_at().
+         Topic: /overview_camera/image_raw  (640×480, 10 Hz)
+    ──────────────────────────────────────────────────────────────────────── -->
+    <model name="overview_camera">
+      <static>true</static>
+      <pose>1.0 0.7 1.5 0 0.68 -2.19</pose>
+      <link name="camera_link">
+        <visual name="vis">
+          <geometry><box><size>0.05 0.05 0.05</size></box></geometry>
+          <material><ambient>0 0 0.8 1</ambient><diffuse>0 0 0.8 1</diffuse></material>
+        </visual>
+        <sensor name="overview_camera" type="camera">
+          <update_rate>10</update_rate>
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip><near>0.05</near><far>5.0</far></clip>
+          </camera>
+          <plugin name="overview_camera_plugin" filename="libgazebo_ros_camera.so">
+            <ros>
+              <remapping>~/image_raw:=/overview_camera/image_raw</remapping>
+              <remapping>~/camera_info:=/overview_camera/camera_info</remapping>
+            </ros>
+            <camera_name>overview_camera</camera_name>
+            <frame_name>overview_camera_link</frame_name>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+
+
+    <!-- ── Arricchimento scena workshop ─────────────────────────────────────── -->
+
+    <!-- Scaffale a muro (Wire_Shelf) — posizione manuale -->
+    <include>
+      <uri>model://Wire_Shelf</uri>
+      <name>wall_shelf</name>
+      <pose>-2.3245 2.3517 0 0 0 -1.5708</pose>
+    </include>
+
+    <!-- Secondo armadietto attrezzi (file_cabinet_large) — angolo destra -->
+    <include>
+      <uri>model://file_cabinet_large</uri>
+      <name>tool_cabinet</name>
+      <pose>-1.6 -3.0 0 0 0 1.5708</pose>
+    </include>
+
+    <!-- Cono segnaletico officina — SDF primitivo (base + corpo arancione) -->
+    <model name="safety_cone"><static>true</static>
+      <pose>-2.5 -2.0 0 0 0 0</pose>
+      <!-- base piatta grigio scuro -->
+      <link name="base"><pose>0 0 0.015 0 0 0</pose>
+        <collision name="c"><geometry><cylinder><radius>0.17</radius><length>0.030</length></cylinder></geometry></collision>
+        <visual name="v"><geometry><cylinder><radius>0.17</radius><length>0.030</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.30 0.30 0.30 1</diffuse></material></visual>
+      </link>
+      <!-- corpo arancione -->
+      <link name="body"><pose>0 0 0.255 0 0 0</pose>
+        <collision name="c"><geometry><cylinder><radius>0.08</radius><length>0.45</length></cylinder></geometry></collision>
+        <visual name="v"><geometry><cylinder><radius>0.08</radius><length>0.45</length></cylinder></geometry>
+          <material><ambient>0.95 0.45 0.02 1</ambient><diffuse>1.0 0.55 0.03 1</diffuse></material></visual>
+      </link>
+      <!-- fascia bianca riflettente -->
+      <link name="stripe"><pose>0 0 0.16 0 0 0</pose>
+        <visual name="v"><geometry><cylinder><radius>0.082</radius><length>0.05</length></cylinder></geometry>
+          <material><ambient>0.95 0.95 0.95 1</ambient><diffuse>1.0 1.0 1.0 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- Chiave a bussola (wood_cube_5cm come sostituto finché niente di meglio) 
+         = dado/bullone graspabile extra sul bancone -->
+    <model name="hex_bolt"><static>false</static>
+      <pose>0.65 -0.05 0.7815 0 0 0.785</pose>
+      <link name="link">
+        <inertial><mass>0.08</mass>
+          <inertia><ixx>1e-5</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>1e-5</iyy><iyz>0</iyz><izz>1e-5</izz></inertia>
+        </inertial>
+        <collision name="col">
+          <geometry><cylinder><radius>0.018</radius><length>0.035</length></cylinder></geometry>
+          <surface><friction><ode><mu>0.8</mu><mu2>0.8</mu2></ode></friction></surface>
+        </collision>
+        <visual name="vis">
+          <geometry><cylinder><radius>0.018</radius><length>0.035</length></cylinder></geometry>
+          <material><ambient>0.50 0.50 0.52 1</ambient><diffuse>0.65 0.65 0.68 1</diffuse>
+          <specular>0.8 0.8 0.8 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+
+  </world>
+</sdf>

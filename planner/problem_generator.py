@@ -46,6 +46,8 @@ def extract_objects_and_locations(steps: list[PlanStep]) -> tuple[set[str], set[
             objects.add(args["object"])
         if "location" in args:
             locations.add(args["location"])
+        if step.primitive == "look_at" and "target" in args:
+            objects.add(args["target"])   # look_at target is an item
 
     return objects, locations
 
@@ -124,6 +126,14 @@ def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, ...]]:
                 if obj:
                     goal.append(("holding", obj))
 
+    # look_at-only plan: goal = camera aimed at target
+    if not goal:
+        for step in steps:
+            if step.primitive == "look_at":
+                target = step.args.get("target", "")
+                if target:
+                    goal.append(("camera-aimed-at", target))
+
     return goal
 
 
@@ -188,6 +198,24 @@ def generate_problem(
         lines.append(f"    (reachable {loc})")
     if not held_objects:
         lines.append("    (gripper-empty)")    # omit if arm is holding something
+
+    # Phase 2: camera-aimed-at for each pick object NOT covered by a look_at
+    # in THIS plan.  If look_at IS in the plan it will ACHIEVE camera-aimed-at
+    # (so it must NOT be in init — FD would skip look_at as redundant).
+    # If look_at is absent the prior iteration already aimed the camera → add to init.
+    look_at_targets = {
+        step.args.get("target", "")
+        for step in plan.steps
+        if step.primitive == "look_at"
+    }
+    pick_objects = {
+        step.args.get("object", "")
+        for step in plan.steps
+        if step.primitive in _PICK_PRIMITIVES and step.args.get("object", "")
+    }
+    for obj in sorted(pick_objects - look_at_targets):
+        lines.append(f"    (camera-aimed-at {obj})")
+
     lines.append("  )")
     lines.append("")
 
@@ -196,11 +224,14 @@ def generate_problem(
     on_goals     = [f for f in goal_facts if f[0] == "on"]
     holding_goals = [f for f in goal_facts if f[0] == "holding"]
 
+    camera_goals  = [f for f in goal_facts if f[0] == "camera-aimed-at"]
     all_goal_facts = []
     for f in on_goals:
         all_goal_facts.append(f"(on {f[1]} {f[2]})")
     for f in holding_goals:
         all_goal_facts.append(f"(holding {f[1]})")
+    for f in camera_goals:
+        all_goal_facts.append(f"(camera-aimed-at {f[1]})")
 
     if not all_goal_facts:
         all_goal_facts = ["(gripper-empty)  ; no explicit goal inferred"]

@@ -257,16 +257,8 @@ def main() -> None:
         print(f"  Domain additions: {plan.domain_additions}")
     print(f"  Steps ({len(plan.steps)}):")
     for i, step in enumerate(plan.steps, 1):
-        args_str = ", ".join(
-            f"{k}={v}" for k, v in step.args.items()
-            if k not in ("bbox", "location_bbox")
-        )
-        bbox_info = ""
-        if "bbox" in step.args:
-            bbox_info += f"  📍 {step.args['bbox']}"
-        if "location_bbox" in step.args:
-            bbox_info += f"  📍loc {step.args['location_bbox']}"
-        print(f"    {i}. {step.primitive}({args_str}){bbox_info}")
+        args_str = ", ".join(f"{k}={v}" for k, v in step.args.items())
+        print(f"    {i}. {step.primitive}({args_str})")
     print("=" * 60)
 
     # ── PDDL problem preview (from pipeline) ─────────────────────────────────
@@ -280,48 +272,7 @@ def main() -> None:
         except Exception as _e:
             pass  # non-fatal: problema non generabile senza PDDL module
 
-    # ── Debug image: proiezioni Gazebo + bbox VLM ─────────────────────────────
-    if images and gazebo_poses:
-        try:
-            from PIL import ImageDraw, ImageFont
-            from vlm.perception import world_to_pixel
-            import numpy as np
-            debug_img = images[0].copy()
-            draw      = ImageDraw.Draw(debug_img)
-            W, H      = debug_img.size
-
-            # Draw projected Gazebo model positions (green circles + label)
-            for mname, pos in gazebo_poses.items():
-                px = world_to_pixel(np.array([pos["x"], pos["y"], pos["z"]]))
-                if px:
-                    u, v = px
-                    r = 8
-                    draw.ellipse([u-r, v-r, u+r, v+r], outline="lime", width=2)
-                    draw.text((u+10, v-8), mname, fill="lime")
-
-            # Draw VLM bounding boxes (orange for object, cyan for location)
-            for step in plan.steps:
-                bbox = step.args.get("bbox")
-                if bbox and len(bbox) == 4:
-                    x1,y1,x2,y2 = [int(x) for x in bbox]
-                    draw.rectangle([x1,y1,x2,y2], outline="orange", width=2)
-                    obj = step.args.get("object", step.args.get("target","?"))
-                    draw.text((x1, y1-12), f"pick:{obj}", fill="orange")
-                loc_bbox = step.args.get("location_bbox")
-                if loc_bbox and len(loc_bbox) == 4:
-                    x1,y1,x2,y2 = [int(x) for x in loc_bbox]
-                    draw.rectangle([x1,y1,x2,y2], outline="cyan", width=2)
-                    loc = step.args.get("location","?")
-                    draw.text((x1, y1-12), f"place:{loc}", fill="cyan")
-
-            debug_path = _REPO_ROOT / "data" / "scene_debug.png"
-            debug_img.save(str(debug_path))
-            print(f"[INFO] Debug image saved: {debug_path}")
-            print("       🟢 verde  = posizione proiettata Gazebo model")
-            print("       🟠 arancio = bbox VLM oggetto da prendere")
-            print("       🔵 ciano  = bbox VLM location di deposito")
-        except Exception as _e:
-            print(f"[WARN] Debug image failed: {_e}")
+    # bbox VLM rimossi dal pipeline — nessuna debug image basata su bbox
 
     # ── Serialize ─────────────────────────────────────────────────────────────
     payload = json.dumps({

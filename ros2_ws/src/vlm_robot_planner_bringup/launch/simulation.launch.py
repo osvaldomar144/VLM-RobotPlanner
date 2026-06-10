@@ -55,12 +55,24 @@ def generate_launch_description() -> LaunchDescription:
         default_value="true",
         description="Launch RViz2 for visualization",
     )
+    world_arg = DeclareLaunchArgument(
+        "world_name",
+        default_value="tabletop",
+        description=(
+            "World file to load (without .world extension). "
+            "Available: tabletop (default), fetchit_manipulation, office_manipulation. "
+            "Run bin/download_extra_scenes.sh first to get the extra worlds."
+        ),
+    )
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     bringup_share   = get_package_share_directory("vlm_robot_planner_bringup")
     gazebo_ros_share = get_package_share_directory("gazebo_ros")
 
-    world_path = os.path.join(bringup_share, "worlds", "tabletop.world")
+    world_path = PathJoinSubstitution([
+        bringup_share, "worlds",
+        [LaunchConfiguration("world_name"), ".world"]
+    ])
     urdf_path  = os.path.join(bringup_share, "urdf",   "panda_sim.urdf.xacro")
     rviz_path  = os.path.join(bringup_share, "config", "moveit.rviz")
 
@@ -227,6 +239,7 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         rviz_arg,
+        world_arg,
         # Gazebo + robot
         gazebo,
         robot_state_publisher,

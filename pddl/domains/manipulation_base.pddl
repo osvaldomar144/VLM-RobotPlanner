@@ -22,7 +22,8 @@
 
   (:action pick
     :parameters (?i - item ?l - location)
-    :precondition (and (on ?i ?l) (clear ?i) (gripper-empty) (reachable ?l))
+    :precondition (and (on ?i ?l) (clear ?i) (gripper-empty) (reachable ?l)
+                       (camera-aimed-at ?i))
     :effect (and (holding ?i)
                  (not (gripper-empty))
                  (not (on ?i ?l)))

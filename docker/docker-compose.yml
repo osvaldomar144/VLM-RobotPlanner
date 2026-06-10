@@ -28,9 +28,14 @@ services:
       - DISPLAY=${DISPLAY}
       - ROS_DOMAIN_ID=42   # valore unico per non mischiarsi con altri utenti ROS2 sul PC
       - VLMRP_REPO_ROOT=/workspace  # repo root for planner/, vlm/, simulation/ imports
-      # Gazebo Classic model paths
-      - GAZEBO_MODEL_PATH=/usr/share/gazebo-11/models:/workspace/ros2_ws/install/vlm_robot_planner_bringup/share/vlm_robot_planner_bringup/models
+      # Gazebo Classic model paths — install/ for built packages, src/ for
+      # models downloaded by bin/download_extra_scenes.sh (no rebuild needed)
+      # 3DGEMS subcategories added for realistic visual meshes
+      # 3DGEMS archives extract with double nesting: category/category/model/
+      - GAZEBO_MODEL_PATH=/usr/share/gazebo-11/models:/workspace/ros2_ws/install/vlm_robot_planner_bringup/share/vlm_robot_planner_bringup/models:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/stationery/stationery:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/kitchen/kitchen:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/tools/tools:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/furniture/furniture:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/food/food:/workspace/ros2_ws/src/vlm_robot_planner_bringup/models/3dgems/electronics/electronics
       - GAZEBO_RESOURCE_PATH=/usr/share/gazebo-11
+      # Boeing plugin .so path (physics-based object grasping)
+      - GAZEBO_PLUGIN_PATH=/opt/boeing_ws/install/boeing_gazebo_model_attachment_plugin/lib
 
     volumes:
       # X11 socket for Gazebo / RViz2 GUI

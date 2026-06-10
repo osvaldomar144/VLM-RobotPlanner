@@ -9,7 +9,7 @@ Each iteration:
   1. Pre-scan: move arm to scan pose via _pre_scan.py (wrist camera view)
   2. Capture: take image from wrist camera via _capture_scene.py
   3. VLM: plan_next_step(task, image, completed_steps) -> single action
-  4. Ground: OWL-ViT or bbox grounding -> correct names
+  4. Ground: GroundingDINO -> correct object names and 3D poses
   5. Inject: send single-step plan to orchestrator
   6. Wait: _wait_step_complete.py -> get completion signal
   7. If complete: break; else: add step to completed_steps, repeat
@@ -101,6 +101,82 @@ def _get_gazebo_models(args) -> dict:
     return {}
 
 
+def _publish_perception_pose(
+    args, object_name: str, x: float, y: float, z: float
+) -> bool:
+    """Publish a perception-estimated pose to /perception/object_pose."""
+    bash_cmd = (
+        "source /opt/ros/humble/setup.bash && "
+        "source /workspace/ros2_ws/install/setup.bash && "
+        f"python3 /workspace/scripts/_publish_perception_pose.py "
+        f"--object {object_name} --x {x:.6f} --y {y:.6f} --z {z:.6f}"
+    )
+    r = _run_in_container(args, bash_cmd, timeout=10)
+    for line in r.stdout.decode().strip().splitlines():
+        print(f"       {line}")
+    return r.returncode == 0
+
+
+def _run_perception(
+    args,
+    target_name: str,
+    perception,
+    obj_z_base: float = 0.025,
+    placed_at: dict | None = None,
+    excl_radius: float = 0.10,
+) -> bool:
+    """
+    Phase 2: after look_at, capture wrist-camera frame and estimate 3D pose
+    via GroundingDINO. Publishes to /perception/object_pose.
+    Orchestrator prefers this over oracle when cache is fresh.
+    Phase 4 (real robot): same flow, RealSense depth replaces ray-plane z.
+    """
+    from vlm.perception import PerceptionModule
+    from PIL import Image as PilImage
+
+    print("[LOOP] Phase 2: capturing from scan pose…")
+    fresh_path = _capture(args)
+    if fresh_path is None:
+        print("[WARN] Phase 2: capture failed — oracle will be used as fallback")
+        return False
+    obs_image = PilImage.open(fresh_path).convert("RGB")
+
+    data_dir = str(_REPO_ROOT / "data")
+    cam_data = PerceptionModule.load_camera_data(data_dir)
+    if cam_data is None:
+        print("[LOOP] Phase 2: camera calibration not available")
+        return False
+
+    K, cam_to_base = cam_data
+    print(f"[LOOP] Phase 2: GroundingDINO → get_pose('{target_name}')")
+    pose = perception.get_pose(target_name, obs_image, K, cam_to_base,
+                               obj_z_base=obj_z_base)
+
+    if pose is None:
+        print(f"[WARN] Phase 2: '{target_name}' not detected — oracle will be used as fallback")
+        return False
+
+    # Apply spatial exclusion (same logic as pre-step)
+    if placed_at:
+        import numpy as _np3
+        for _ph_obj, (_px, _py) in placed_at.items():
+            _d = float(_np3.linalg.norm([pose['x']-_px, pose['y']-_py]))
+            if _d < excl_radius:
+                print(f"[WARN] Phase 2 exclusion: '{target_name}' at "
+                      f"({pose['x']:.2f},{pose['y']:.2f}) occupied by "
+                      f"'{_ph_obj}' (dist={_d*100:.0f}cm) — treating as not found")
+                return False
+
+    print(
+        f"[LOOP] Phase 2: '{target_name}' → "
+        f"({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f}) panda_link0"
+    )
+    ok = _publish_perception_pose(args, target_name, pose["x"], pose["y"], pose["z"])
+    if ok:
+        print("[OK]   Phase 2: pose published → orchestrator will prefer it over oracle")
+    return ok
+
+
 def _wait_step_complete(args, timeout: int = 60) -> dict:
     """Wait for step completion signal from orchestrator."""
     bash_cmd = (
@@ -140,6 +216,15 @@ def main() -> None:
     completed_steps: list[str] = []
     docker_cmd = _docker(args.container, args.sudo_docker)
 
+    # Spatial exclusion: track where objects have been placed.
+    # After place(X, loc), the location position is marked as occupied by X.
+    # New DINO detections within EXCL_RADIUS of an occupied position are skipped
+    # to avoid re-picking already-handled objects.
+    # Key: VLM object name; Value: (x, y) of the place destination.
+    _placed_at: dict[str, tuple[float, float]] = {}
+    _last_dino_est: dict[str, tuple[float, float]] = {}  # last DINO estimate per name
+    _EXCL_RADIUS = 0.10  # 10cm — objects within this radius are treated as identical
+
     for iteration in range(args.max_steps):
         print(f"\n{'─'*60}")
         print(f"  ITERAZIONE {iteration+1} / {args.max_steps}")
@@ -171,8 +256,25 @@ def main() -> None:
         image.save(str(iter_path))
         print(f"[LOOP] Snapshot: {iter_path.name}")
 
-        # 3. Get Gazebo models
-        gazebo_poses = _get_gazebo_models(args)
+        # Persist last scan-pose image + calibration for place location detection.
+        # When arm is holding an object, the camera view is distorted by the arm.
+        # Using the last FREE scan gives better geometry for location detection.
+        if not holding:
+            import shutil
+            _data = _REPO_ROOT / "data"
+            for fname in ("scene.png", "camera_info.json", "camera_pose.json"):
+                src = _data / fname
+                if src.exists():
+                    shutil.copy2(str(src), str(_data / f"last_scan_{fname}"))
+            print("[LOOP] Last scan saved (arm free → used for place location detection)")
+
+        # 3. Get Gazebo models — filter scene infrastructure (never pick/place targets)
+        _INFRA = frozenset({
+            'floor', 'room', 'ground_plane', 'sun', 'robot_pedestal',
+            'overview_camera', 'table', 'workbench',
+        })
+        gazebo_poses = {k: v for k, v in _get_gazebo_models(args).items()
+                        if k not in _INFRA}
         gazebo_models = list(gazebo_poses.keys())
         print(f"[LOOP] Scene objects: {gazebo_models}")
 
@@ -226,6 +328,15 @@ def main() -> None:
         step0 = plan.steps[0]
         print(f"[LOOP] Prossimo step: {step0.primitive}({step0.args})")
 
+        # Prevent phantom pick: skip pick if already holding an object
+        if step0.primitive == "pick":
+            last_pick  = max((i for i, s in enumerate(completed_steps) if s.startswith("pick")),  default=-1)
+            last_place = max((i for i, s in enumerate(completed_steps) if s.startswith("place") or s.startswith("stack")), default=-1)
+            if last_pick > last_place:
+                print(f"[WARN] Phantom pick detected (already holding) — skipping")
+                completed_steps.append(f"skip_pick({step0.args.get('object','?')})")
+                continue
+
         # Prevent phantom place: skip place if the gripper should be empty
         # (no pick in completed_steps since last place/gripper_open)
         if step0.primitive == "place":
@@ -238,39 +349,137 @@ def main() -> None:
                 default=-1
             )
             if last_pick < last_place:
+                # Count consecutive skip_place to detect stuck loop
+                consecutive_skips = sum(
+                    1 for s in reversed(completed_steps)
+                    if s.startswith("skip_place")
+                    ) if completed_steps else 0
+                if consecutive_skips >= 2:
+                    print(f"[LOOP] ✅ {consecutive_skips} phantom places consecutivi → "
+                          "task considerato completato (oggetto già depositato)")
+                    break
                 print(f"[WARN] Phantom place detected (no pick since last place) — skipping")
                 completed_steps.append(f"skip_place({step0.args.get('object','?')})")
                 continue
 
-        # Save debug image with VLM bboxes only
-        # NOTE: Gazebo model projections (green circles) are NOT shown here because
-        # world_to_pixel uses the fixed overview camera calibration, which is wrong
-        # for the moving wrist camera.  FK-based projection is a Phase 2 task.
-        try:
-            from PIL import ImageDraw
-            dbg = image.copy()
-            draw = ImageDraw.Draw(dbg)
-            for step in plan.steps:
-                for key, color in [("bbox","orange"), ("location_bbox","cyan")]:
-                    b = step.args.get(key)
-                    if b and len(b)==4:
-                        x1,y1,x2,y2 = [int(x) for x in b]
-                        draw.rectangle([x1,y1,x2,y2], outline=color, width=2)
-                        lbl = step.args.get("object" if key=="bbox" else "location","?")
-                        draw.text((x1, max(0,y1-12)), lbl, fill=color)
-            dbg_path = _REPO_ROOT / "data" / f"loop_iter_{iteration+1:02d}_debug.png"
-            dbg.save(str(dbg_path))
-            print(f"[LOOP] Debug: {dbg_path.name} (🟠pick bbox 🔵place bbox)")
-        except Exception as _e:
-            pass
+        # Save iteration snapshot (no bbox overlay — bboxes removed from pipeline)
+        # The scene image is already saved as loop_iter_NN.png above.
 
-        # 5. Ground names — OWL-ViT (bbox grounding requires camera calibration
-        # that changes with arm position — only valid for fixed overview camera)
-        plan_grounded = perception.ground_names(
-            plan, image,
-            known_items=gazebo_models,
-            known_locations=gazebo_models,
-        )
+        # Phase 2: no grounding — VLM names used directly for DINO queries.
+        # ground_names() was for Phase 1 oracle lookup (Gazebo model names).
+        # In Phase 2, DINO takes any natural language query ("glass", "the cup")
+        # and finds the object. Consistent names across iterations = no mismatch.
+        from copy import deepcopy
+        plan_grounded = deepcopy(plan)
+
+        # 5c. Phase 2: DINO stima le pose di TUTTI gli oggetti nel passo corrente
+        # dall'immagine scan. Questo copre:
+        #   - look_at: pubblica posa → orchestratore passa a LookAtPrimitive → j0 direzionale
+        #   - pick: posa già gestita via _run_perception dopo look_at, ma pre-stima utile
+        #   - place: posa della location
+        # Tutti pubblicati su /perception/object_pose → orchestratore preferisce su oracle.
+        _data_dir = str(_REPO_ROOT / "data")
+        step0 = plan_grounded.steps[0] if plan_grounded.steps else None
+        if step0:
+            try:
+                from vlm.perception import PerceptionModule
+                cam_data = PerceptionModule.load_camera_data(_data_dir)
+                if cam_data:
+                    K_s, ctb_s = cam_data
+                    # Raccogli tutti i nomi oggetto nel passo corrente
+                    # For place locations use the LAST SCAN image (arm free, better geometry).
+                    # If no last_scan exists yet, fall back to current image.
+                    _last_scan_img_path = _REPO_ROOT / "data" / "last_scan_scene.png"
+                    _last_scan_info_path = _REPO_ROOT / "data" / "last_scan_camera_info.json"
+                    _last_scan_pose_path = _REPO_ROOT / "data" / "last_scan_camera_pose.json"
+                    _has_last_scan = (_last_scan_img_path.exists() and
+                                      _last_scan_info_path.exists() and
+                                      _last_scan_pose_path.exists())
+
+                    if _has_last_scan:
+                        _scan_img  = PilImage.open(str(_last_scan_img_path)).convert("RGB")
+                        with open(str(_last_scan_info_path)) as _f:
+                            import json as _json
+                            _ki = _json.load(_f)
+                        import numpy as _np
+                        K_scan  = _np.array(_ki["K"])
+                        with open(str(_last_scan_pose_path)) as _f:
+                            ctb_scan = _np.array(_json.load(_f)["cam_to_base"])
+                    else:
+                        _scan_img, K_scan, ctb_scan = image, K_s, ctb_s
+
+                    # Track name→key mapping to correctly update plan_grounded args
+                    names_to_estimate = {}  # {name: key}
+                    for _key in ("target", "object", "location"):
+                        _n = step0.args.get(_key, "")
+                        if _n and _n not in _INFRA and _n not in names_to_estimate:
+                            names_to_estimate[_n] = _key
+
+                    for name, name_key in names_to_estimate.items():
+                        is_location = (name_key == "location")
+                        # Use last_scan for locations (arm free → better angle)
+                        det_img  = _scan_img if (is_location and _has_last_scan) else image
+                        det_K    = K_scan    if (is_location and _has_last_scan) else K_s
+                        det_ctb  = ctb_scan  if (is_location and _has_last_scan) else ctb_s
+                        src_label = "last_scan" if (is_location and _has_last_scan) else "current"
+                        pose_est = perception.get_pose(
+                            name, det_img, det_K, det_ctb,
+                            vlm_description=name.replace("_", " "),
+                        )
+                        if pose_est:
+                            # Spatial exclusion: only for PICK targets, NOT for locations.
+                            # Locations (e.g. keyboard) can receive multiple objects.
+                            import numpy as _np2
+                            _excl_match = None
+                            if name_key != "location":
+                                for _ph_obj, (_px, _py) in _placed_at.items():
+                                    _d = float(_np2.linalg.norm(
+                                        [pose_est['x']-_px, pose_est['y']-_py]))
+                                    if _d < _EXCL_RADIUS:
+                                        _excl_match = (_ph_obj, _d)
+                                        break
+                            if _excl_match:
+                                print(f"[LOOP] Spatial exclusion: '{name}' at "
+                                      f"({pose_est['x']:.2f},{pose_est['y']:.2f}) "
+                                      f"occupied by '{_excl_match[0]}' "
+                                      f"(dist={_excl_match[1]*100:.0f}cm) — skip")
+                                pose_est = None
+                            else:
+                                # Track last estimate
+                                _last_dino_est[name] = (pose_est['x'], pose_est['y'])
+
+                        if pose_est:
+                            print(f"[LOOP] Phase 2 DINO pre-step [{src_label}]: '{name}' → "
+                                  f"({pose_est['x']:.3f},{pose_est['y']:.3f},{pose_est['z']:.3f})")
+                            _publish_perception_pose(
+                                args, name, pose_est['x'], pose_est['y'], pose_est['z'])
+
+                            # Sim-only: GazeboAttach needs actual Gazebo model name.
+                            # Resolve VLM name → nearest Gazebo model by position.
+                            if name not in gazebo_poses and step0.primitive in ("pick", "place"):
+                                import numpy as _np
+                                _RBASE_XY = _np.array([0.20, 0.0])
+                                _px = _np.array([pose_est['x'], pose_est['y']])
+                                _best_gz, _best_d = None, float('inf')
+                                for _gz, _gp in gazebo_poses.items():
+                                    _gz_xy = _np.array([_gp['x'], _gp['y']]) - _RBASE_XY
+                                    _d = float(_np.linalg.norm(_px - _gz_xy))
+                                    if _d < _best_d:
+                                        _best_d, _best_gz = _d, _gz
+                                if _best_gz and _best_d < 0.15:
+                                    _publish_perception_pose(
+                                        args, _best_gz, pose_est['x'], pose_est['y'], pose_est['z'])
+                                    # Update correct key in plan_grounded
+                                    step0.args = dict(step0.args)
+                                    step0.args[name_key] = _best_gz
+                                    print(f"[LOOP] GazeboAttach: '{name}' → '{_best_gz}' "
+                                          f"(dist={_best_d*100:.1f}cm, sim-only)")
+                        else:
+                            print(f"[LOOP] Phase 2 DINO pre-step: '{name}' non rilevato — oracle fallback")
+            except Exception as _pe:
+                print(f"[WARN] pre-step perception failed: {_pe}")
+
+        # 5b. RIMOSSO — bbox-ground sostituito da DINO-only (step 5c).
 
         # Show PDDL problem for this step
         try:
@@ -314,17 +523,39 @@ def main() -> None:
         # so the VLM can match its own terminology with the completed action.
         s0_orig = plan.steps[0]
         s0_grnd = plan_grounded.steps[0]
+        # Always use ORIGINAL VLM names in completed_steps context.
+        # The Gazebo resolution (glass→coffee_cup) is sim-internal — VLM should
+        # see its own names so it recognises completed steps correctly.
         obj_orig = s0_orig.args.get("object", s0_orig.args.get("target", "?"))
-        obj_grnd = s0_grnd.args.get("object", s0_grnd.args.get("target", "?"))
         loc_orig = s0_orig.args.get("location", "")
-        loc_grnd = s0_grnd.args.get("location", "")
-        # E.g.: "place(blue_cube->blue_box, red_cylinder->red_cup)"
-        obj_str = f"{obj_orig}->{obj_grnd}" if obj_orig != obj_grnd else obj_grnd
-        loc_str = f"{loc_orig}->{loc_grnd}" if loc_orig != loc_grnd else loc_grnd
-        step_desc = f"{s0_grnd.primitive}({obj_str}, {loc_str})" if loc_grnd else f"{s0_grnd.primitive}({obj_str})"
+        step_desc = (f"{s0_orig.primitive}({obj_orig}, {loc_orig})"
+                     if loc_orig else f"{s0_orig.primitive}({obj_orig})")
         if result.get("success"):
+            # Detect look_at loop: if same look_at target already in completed, stop
+            if s0_grnd.primitive == "look_at" and step_desc in completed_steps:
+                print(f"[WARN] look_at('{obj_orig}') già eseguito — DINO non riesce a trovare "
+                      "l'oggetto. Verificare il nome dell'oggetto nella scena.")
+                break
             completed_steps.append(step_desc)
             print(f"[OK]   Step completato: {step_desc}")
+
+            # Phase 2: after look_at → DINO estimates 3D pose, publishes to cache
+            if s0_grnd.primitive == "look_at":
+                target = s0_grnd.args.get("target", obj_orig)
+                _run_perception(args, target, perception,
+                                placed_at=_placed_at, excl_radius=_EXCL_RADIUS)
+
+            # Track place destinations for spatial exclusion.
+            # After place(X, loc), loc's position is recorded as occupied by X.
+            # Future DINO detections within _EXCL_RADIUS of that position are skipped.
+            if s0_orig.primitive == "place":
+                obj_placed = s0_orig.args.get("object", "")
+                loc_placed = s0_grnd.args.get("location", "")
+                if obj_placed and loc_placed in _last_dino_est:
+                    px, py = _last_dino_est[loc_placed]
+                    _placed_at[obj_placed] = (px, py)
+                    print(f"[LOOP] Spatial exclusion: '{obj_placed}' marked at "
+                          f"({px:.2f},{py:.2f}) — excluded from future detections")
         else:
             print(f"[FAIL] Step fallito: {step_desc}")
             break
