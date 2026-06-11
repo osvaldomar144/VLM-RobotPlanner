@@ -36,6 +36,10 @@ AVAILABLE ACTIONS
                                   Do NOT use compound names like "next_to_keyboard" or
                                   "left_of_table" — use the object name directly.
 
+VISUAL MARKERS: Objects already handled (picked and placed) are marked with a GREEN ✓
+circle overlay in the image. These objects are DONE — do not pick them again.
+Focus only on objects WITHOUT a green marker to continue the task.
+
 OBJECT NAMING: always use the SPECIFIC visual name of each object as seen in the image
 (e.g. "pen", "eraser", "notebook"). Do NOT invent abstract category names like
 "writing_tool_1", "item_2", "object_3". If a task mentions a category ("writing tools"),

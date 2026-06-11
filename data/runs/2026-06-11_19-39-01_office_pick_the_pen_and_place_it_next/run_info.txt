@@ -1,0 +1,5 @@
+timestamp: 2026-06-11_19-39-01
+world:     office
+task:      pick the pen and place it next to the keyboard
+steps:     ['look_at(pen)', 'pick(pen)', 'place(pen, keyboard)']
+n_steps:   3

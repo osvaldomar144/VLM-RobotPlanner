@@ -1,0 +1,75 @@
+{
+  "iteration": 3,
+  "task": "pick the pen and place it next to the keyboard",
+  "world": "office",
+  "completed_steps": [
+    "look_at(pen)",
+    "pick(pen)"
+  ],
+  "vlm_time_s": 10.2,
+  "plan_raw": {
+    "goal": "pick the pen and place it next to the keyboard",
+    "steps": [
+      {
+        "primitive": "place",
+        "args": {
+          "object": "pen",
+          "location": "keyboard"
+        }
+      }
+    ],
+    "raw_output": "{\n  \"goal\": \"pick the pen and place it next to the keyboard\",\n  \"complete\": false,\n  \"replanning\": false,\n  \"replan_reason\": \"\",\n  \"domain_template\": \"manipulation_base\",\n  \"domain_additions\": {\n    \"new_types\": [],\n    \"new_predicates\": [],\n    \"new_actions\": [],\n    \"modified_preconditions\": {}\n  },\n  \"steps\": [\n    {\n      \"primitive\": \"place\",\n      \"args\": {\n        \"object\": \"pen\",\n        \"location\": \"keyboard\"\n      }\n    }\n  ]\n}",
+    "domain_template": "manipulation_base",
+    "domain_additions": {
+      "new_types": [],
+      "new_predicates": [],
+      "new_actions": [],
+      "modified_preconditions": {}
+    }
+  },
+  "plan_grounded": {
+    "goal": "pick the pen and place it next to the keyboard",
+    "steps": [
+      {
+        "primitive": "place",
+        "args": {
+          "object": "pen",
+          "location": "keyboard"
+        }
+      }
+    ],
+    "raw_output": "{\n  \"goal\": \"pick the pen and place it next to the keyboard\",\n  \"complete\": false,\n  \"replanning\": false,\n  \"replan_reason\": \"\",\n  \"domain_template\": \"manipulation_base\",\n  \"domain_additions\": {\n    \"new_types\": [],\n    \"new_predicates\": [],\n    \"new_actions\": [],\n    \"modified_preconditions\": {}\n  },\n  \"steps\": [\n    {\n      \"primitive\": \"place\",\n      \"args\": {\n        \"object\": \"pen\",\n        \"location\": \"keyboard\"\n      }\n    }\n  ]\n}",
+    "domain_template": "manipulation_base",
+    "domain_additions": {
+      "new_types": [],
+      "new_predicates": [],
+      "new_actions": [],
+      "modified_preconditions": {}
+    }
+  },
+  "domain_template": "manipulation_base",
+  "domain_additions": {
+    "new_types": [],
+    "new_predicates": [],
+    "new_actions": [],
+    "modified_preconditions": {}
+  },
+  "pddl_problem": "(define (problem generated_problem)\n  (:domain manipulation-base)\n\n  (:objects\n    pen - item\n    keyboard - location\n  )\n\n  (:init\n    (holding pen)\n    (clear pen)\n    (reachable keyboard)\n  )\n\n  (:goal\n    (on pen keyboard)\n  )\n)",
+  "step_primitive": "place",
+  "step_args": {
+    "object": "pen",
+    "location": "keyboard"
+  },
+  "dino_estimates": {
+    "pen": [
+      0.41404984433175085,
+      -0.15685053150173212
+    ],
+    "keyboard": [
+      0.7738589688223944,
+      -0.012703522610529316
+    ]
+  },
+  "placed_at": {},
+  "using_overview_cam": true
+}

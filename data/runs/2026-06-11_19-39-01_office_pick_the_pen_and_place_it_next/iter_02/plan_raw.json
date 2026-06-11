@@ -1,0 +1,19 @@
+{
+  "goal": "pick the pen and place it next to the keyboard",
+  "steps": [
+    {
+      "primitive": "pick",
+      "args": {
+        "object": "pen"
+      }
+    }
+  ],
+  "raw_output": "{\n  \"goal\": \"pick the pen and place it next to the keyboard\",\n  \"complete\": false,\n  \"replanning\": false,\n  \"replan_reason\": \"\",\n  \"domain_template\": \"manipulation_base\",\n  \"domain_additions\": {\n    \"new_types\": [],\n    \"new_predicates\": [],\n    \"new_actions\": [],\n    \"modified_preconditions\": {}\n  },\n  \"steps\": [\n    {\n      \"primitive\": \"pick\",\n      \"args\": {\n        \"object\": \"pen\"\n      }\n    },\n    {\n      \"primitive\": \"place\",\n      \"args\": {\n        \"object\": \"pen\",\n        \"location\": \"keyboard\"\n      }\n    }\n  ]\n}",
+  "domain_template": "manipulation_base",
+  "domain_additions": {
+    "new_types": [],
+    "new_predicates": [],
+    "new_actions": [],
+    "modified_preconditions": {}
+  }
+}

@@ -402,7 +402,8 @@
     ──────────────────────────────────────────────────────────────────────── -->
     <model name="overview_camera">
       <static>true</static>
-      <pose>1.0 0.7 1.5 0 0.68 -2.19</pose>
+      <!-- stessa posizione, ruotata verso X+ (yaw 30°, target bordo dx scrivania) -->
+      <pose>-0.20 -1.00 2.10 0 0.690 0.519</pose>
       <link name="camera_link">
         <visual name="vis">
           <geometry><box><size>0.05 0.05 0.05</size></box></geometry>

@@ -87,8 +87,9 @@ class VLMPlanner:
     and produces a primitive sequence — no separate text description needed.
     """
 
-    SYSTEM_PROMPT_PATH      = Path(__file__).parent / "prompts" / "system_prompt.txt"
-    SYSTEM_PROMPT_LOOP_PATH = Path(__file__).parent / "prompts" / "system_prompt_loop.txt"
+    SYSTEM_PROMPT_PATH           = Path(__file__).parent / "prompts" / "system_prompt.txt"
+    SYSTEM_PROMPT_LOOP_PATH      = Path(__file__).parent / "prompts" / "system_prompt_loop.txt"
+    SYSTEM_PROMPT_REPLANNING_PATH = Path(__file__).parent / "prompts" / "system_prompt_replanning.txt"
 
     def __init__(self, model_name: str = "Qwen/Qwen3-VL-8B-Instruct"):
         self.model_name = model_name
@@ -176,6 +177,66 @@ class VLMPlanner:
             )
             if data.get("complete"):
                 plan.steps = []   # empty steps = task done
+        except Exception:
+            pass
+
+        return plan
+
+    def plan_remaining(
+        self,
+        task:            str,
+        images:          list[ImageInput],
+        completed_steps: list[str],
+        failed_step:     str | None = None,
+    ) -> VLMPlan:
+        """Replanning mode: generate the COMPLETE remaining plan from current state.
+
+        Called either at task start (completed_steps=[]) or after a failure.
+        Returns ALL remaining steps to complete the task.
+
+        Args:
+            task:            Overall task description.
+            images:          Current scene image(s) — overview camera preferred.
+            completed_steps: Steps already executed successfully.
+            failed_step:     The step that just failed (for replan context), or None.
+
+        Returns:
+            VLMPlan with all remaining steps, or empty steps if task is complete.
+        """
+        if self._model is None:
+            raise RuntimeError("Call load() before plan_remaining()")
+
+        pil_images    = [self._to_pil(img) for img in images]
+        system_prompt = self.SYSTEM_PROMPT_REPLANNING_PATH.read_text()
+
+        completed_str = (
+            "\n".join(f"  - {s}" for s in completed_steps)
+            if completed_steps else "  (none yet)"
+        )
+        failed_str = f"\n\nFailed step (just failed — replan needed):\n  {failed_step}" \
+                     if failed_step else ""
+
+        user_text = (
+            f"Task goal: {task}\n\n"
+            f"Completed steps:\n{completed_str}"
+            f"{failed_str}\n\n"
+            f"Generate the COMPLETE remaining plan to finish the task."
+        )
+
+        messages = self._build_messages(system_prompt, user_text, pil_images)
+        raw  = self._run_inference(messages)
+        plan = self._parse_output(task, raw)
+
+        try:
+            data = __import__("json").loads(
+                raw if raw.strip().startswith("{") else
+                __import__("re").search(r"\{.*\}", raw, __import__("re").DOTALL).group()
+            )
+            if data.get("complete"):
+                plan.steps = []
+            # Store replan metadata in plan for debug logging
+            if data.get("replanning") and data.get("replan_reason"):
+                plan.raw_output = f"[REPLAN: {data['replan_reason']}]\n{plan.raw_output}"
         except Exception:
             pass
 

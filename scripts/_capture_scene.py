@@ -33,9 +33,11 @@ from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 import tf2_ros
 
-_OUTPUT_PATH       = "/workspace/data/scene.png"
-_CAM_INFO_PATH     = "/workspace/data/camera_info.json"
-_CAM_POSE_PATH     = "/workspace/data/camera_pose.json"
+_OUTPUT_PATH          = "/workspace/data/scene.png"
+_OVERVIEW_PATH        = "/workspace/data/scene_overview.png"
+_OVERVIEW_INFO_PATH   = "/workspace/data/overview_camera_info.json"
+_CAM_INFO_PATH        = "/workspace/data/camera_info.json"
+_CAM_POSE_PATH        = "/workspace/data/camera_pose.json"
 _TIMEOUT_SEC       = 8.0
 _TF_RETRIES        = 5
 _TF_RETRY_SLEEP    = 0.3
@@ -91,6 +93,7 @@ class _CaptureNode(Node):
     def __init__(self) -> None:
         super().__init__("_scene_capture")
         self.saved            = False
+        self.overview_saved   = False   # overview camera saved separately
         self._primary         = _TOPICS[0]
         self._primary_deadline = time.time() + _PRIMARY_TOPIC_TIMEOUT
         self._K: np.ndarray | None = None
@@ -101,9 +104,22 @@ class _CaptureNode(Node):
             self.create_subscription(
                 Image, topic,
                 lambda msg, t=topic: self._cb(msg, t),
-                qos_profile_sensor_data,   # BEST_EFFORT — compatible with all Gazebo camera plugins
+                qos_profile_sensor_data,
             )
             self.get_logger().info(f"Listening on {topic}")
+
+        # Always capture overview camera independently (fixed reference for VLM)
+        self.create_subscription(
+            Image, "/overview_camera/image_raw",
+            self._cb_overview,
+            qos_profile_sensor_data,
+        )
+        self._overview_K: np.ndarray | None = None
+        self.create_subscription(
+            CameraInfo, "/overview_camera/camera_info",
+            self._overview_cam_info_cb,
+            qos_profile_sensor_data,
+        )
 
         self.create_subscription(
             CameraInfo, "/wrist_camera/camera_info",
@@ -152,6 +168,33 @@ class _CaptureNode(Node):
                     print(f"[WARN] TF lookup failed after {_TF_RETRIES} attempts: {exc}",
                           file=sys.stderr)
 
+    def _overview_cam_info_cb(self, msg: CameraInfo) -> None:
+        if self._overview_K is not None:
+            return
+        k = msg.k
+        self._overview_K = np.array([
+            [k[0], k[1], k[2]],
+            [k[3], k[4], k[5]],
+            [k[6], k[7], k[8]],
+        ])
+        data = {"K": self._overview_K.tolist(), "width": msg.width, "height": msg.height}
+        with open(_OVERVIEW_INFO_PATH, "w") as f:
+            import json
+            json.dump(data, f)
+        print(f"[OK] Overview camera info saved: {_OVERVIEW_INFO_PATH}")
+
+    def _cb_overview(self, msg: Image) -> None:
+        """Save overview camera image — fixed external reference for VLM."""
+        if self.overview_saved:
+            return
+        try:
+            img = _ros_image_to_pil(msg)
+            img.save(_OVERVIEW_PATH)
+            self.overview_saved = True
+            print(f"[OK] Overview saved: {_OVERVIEW_PATH} ({img.width}×{img.height})")
+        except Exception:
+            pass
+
     def _cb(self, msg: Image, topic: str) -> None:
         if self.saved:
             return
@@ -179,8 +222,11 @@ def main() -> None:
     executor.add_node(node)
 
     t0 = time.time()
-    while not node.saved and (time.time() - t0) < _TIMEOUT_SEC:
+    # Wait for wrist camera (primary) AND overview camera
+    while (time.time() - t0) < _TIMEOUT_SEC:
         executor.spin_once(timeout_sec=0.1)
+        if node.saved and node.overview_saved:
+            break
 
     node.destroy_node()
     rclpy.shutdown()
