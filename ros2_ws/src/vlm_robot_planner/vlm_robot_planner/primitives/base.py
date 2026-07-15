@@ -49,6 +49,43 @@ _NAMED_CONFIGS = {
     # panda_link0 (table surface), safely above any tabletop object.
     # This config is general — does NOT depend on specific scene objects.
     "safe_retreat": [0.0, -0.9, 0.0, -1.8, 0.0, 0.9, 0.7854],
+
+    # Side-grasp seed: "ready" with j7 shifted by -π for the Ry(90°)·Rz(180°)
+    # quaternion (x=0.707, y=0, z=0.707, w=0) used in side-grasp pick/pour.
+    "side_ready": [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, -2.4],
+
+    # Pour approach seed for tray target (y≈-0.50 in kitchen scene).
+    # Problem: safe_retreat has j1=0 → IK for the tray target (0.43,-0.50,0.40)
+    # with _SIDE_QUAT converges to j1=+1.13 (arm swings LEFT, "wrong" IK branch).
+    # From j1=+1.13 the descent Cartesian path fails at ~40% → OMPL fallback
+    # (10-15s) → random joint config → cascading failures.
+    # Fix: seed from j1=-0.9 (arm already pointing toward y=-0.50 side) so KDL
+    # converges to the natural negative-j1 branch for all subsequent moves.
+    # j2/j4/j6 match safe_retreat to keep the arm at a safe height.
+    # j7=-2.42 matches side_approach so _SIDE_QUAT IK is trivial from this seed.
+    "pour_approach_tray": [-0.9, -0.9, 0.0, -1.8, 0.0, 0.9, -2.42],
+
+    # Pour tilt: joint config for EEF ≈(0.428,-0.498,0.249) with _POUR_TILT_QUAT
+    # over the kitchen scene tray (x=0.43, y=-0.50). Derived from the OMPL
+    # solution in the kitchen scene. Bypasses KDL IK entirely: the transit
+    # lands at j5≈+2.09, but the tilt needs j5≈-0.92 — a 3-rad gap that KDL
+    # gradient descent cannot bridge from that seed. OMPL finds the right config
+    # but takes ≈12s and leaves the arm in a chaotic state. Using a direct
+    # joint-space goal (PILZ PTP, no IK) is deterministic and at _POUR_VEL=0.12
+    # the arm sweeps slowly ≈11s, making the tilt motion clearly visible.
+    "pour_pre_tilt": [-1.20, 0.80, 0.60, -1.44, -0.92, 1.40, 0.36],
+
+    # Side-grasp natural approach configuration (office scene, can at y≈-0.20).
+    # These are the exact joint angles from a successful side-grasp with the OLD
+    # quaternion (x=0, y=0.707, z=0, w=0.707), with j7 shifted by -π to match
+    # the new quaternion (x=0.707, y=0, z=0.707, w=0) — camera UP.
+    # j7 shift: 0.72 - π ≈ -2.42 (within Panda j7 limits [-2.8973, 2.8973]).
+    # j1-j6 unchanged → EEF position is identical to the old pre-grasp.
+    # Used via move_to_configuration (direct joint control, bypasses IK entirely)
+    # so KDL self-collision issues are irrelevant. From this config, PILZ PTP
+    # to the grasp pose uses a small joint delta and finds natural IK trivially.
+    # Phase 4: replace with a general IK solution seeded from this config.
+    "side_approach": [-0.52, 0.58, -0.62, -2.90, 2.03, 1.17, -2.42],
 }
 
 ARM_GROUP  = "panda_arm"
@@ -93,12 +130,20 @@ class ArmPrimitive:
         moveit2: pymoveit2.MoveIt2 instance (shared across all primitives).
     """
 
-    def __init__(self, node: Node, moveit2) -> None:
+    def __init__(self, node: Node, moveit2, tf_buffer=None) -> None:
         self._node    = node
         self._moveit2 = moveit2
         self._gripper_client = ActionClient(
             node, GripperCommand, "/panda_hand_controller/gripper_cmd"
         )
+        # Shared TF buffer passed from orchestrator — one listener for all primitives.
+        # If not provided (e.g. tests), create a local one as fallback.
+        if tf_buffer is not None:
+            self._tf_buffer = tf_buffer
+        else:
+            import tf2_ros
+            self._tf_buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(self._tf_buffer, node)
         # Publisher for AttachedCollisionObject — W5
         from moveit_msgs.msg import AttachedCollisionObject as _ACO
         self._aco_pub = node.create_publisher(
@@ -111,6 +156,17 @@ class ArmPrimitive:
         self._col_pub = node.create_publisher(_ColObj, "/collision_object", 10)
 
         self._held_object_id: str | None = None   # instance-level (legacy compat)
+
+        # Persistent joint-state cache — updated by a long-lived subscription so
+        # _log_eef never creates/destroys subscriptions (which races with the
+        # executor's QoS wait_set and causes InvalidHandle crashes in Humble).
+        from sensor_msgs.msg import JointState as _JS
+        self._last_joint_state = None
+        self._js_sub = node.create_subscription(
+            _JS, "/joint_states",
+            lambda msg: setattr(self, "_last_joint_state", msg),
+            10,
+        )
 
     # ── Arm motions ───────────────────────────────────────────────────────────
 
@@ -188,6 +244,14 @@ class ArmPrimitive:
             return self.move_to_pose_linear(pose, timeout_sec=timeout_sec)
         return True
 
+    def move_to_configuration(self, joint_positions: list, timeout_sec: float = 15.0) -> bool:
+        """Move to an explicit list of 7 joint positions (radians)."""
+        self._moveit2.move_to_configuration(joint_positions)
+        result = self._moveit2.wait_until_executed(timeout=timeout_sec)
+        if not result:
+            self._node.get_logger().warn("ArmPrimitive: move_to_configuration failed.")
+        return result
+
     def move_to_named(self, config_name: str) -> bool:
         """Move to a named joint configuration defined in _NAMED_CONFIGS."""
         joint_positions = _NAMED_CONFIGS.get(config_name)
@@ -205,10 +269,18 @@ class ArmPrimitive:
             return False
         return True
 
+    def _get_current_joints(self) -> list:
+        """Return current arm joint positions from /joint_states. Falls back to side_approach."""
+        js = self._last_joint_state
+        if js is None:
+            return list(_NAMED_CONFIGS["side_approach"])
+        name_to_pos = dict(zip(js.name, js.position))
+        return [name_to_pos.get(n, 0.0) for n in ARM_JOINT_NAMES]
+
     # ── Gripper motions ───────────────────────────────────────────────────────
 
-    def open_gripper(self) -> bool:
-        return self._send_gripper_goal(position=_GRIPPER_OPEN, max_effort=0.0)
+    def open_gripper(self, max_effort: float = 0.0) -> bool:
+        return self._send_gripper_goal(position=_GRIPPER_OPEN, max_effort=max_effort)
 
     def close_gripper(self, effort: float = _GRIPPER_EFFORT) -> bool:
         return self._send_gripper_goal(position=_GRIPPER_CLOSED, max_effort=effort)
@@ -269,7 +341,6 @@ class ArmPrimitive:
 
         Adds a conservative cylinder attached to panda_hand so MoveIt2
         includes the held object in all subsequent collision checks.
-        This is the standard MoveIt2 mechanism — identical on real robot.
 
         Args:
             object_id:       PDDL/Gazebo name of the grasped object.
@@ -277,8 +348,6 @@ class ArmPrimitive:
                              resting on (e.g. "table", "shelf_b").  Added to
                              touch_links so MoveIt2 doesn't block the initial
                              lift due to ACO-surface overlap at grasp height.
-                             This is the standard MoveIt2 pick pattern and
-                             applies identically on the real robot.
 
         Phase 2: replace the fixed cylinder geometry with the actual object
         shape from the PerceptionModule (e.g. from a point cloud segment).
@@ -359,6 +428,22 @@ class ArmPrimitive:
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
+    def _get_current_eef_pos(self, timeout_sec: float = 1.0) -> list | None:
+        """Return current EEF position [x, y, z] in BASE_FRAME via TF lookup."""
+        try:
+            import rclpy.time
+            import rclpy.duration
+            tf = self._tf_buffer.lookup_transform(
+                BASE_FRAME, EEF_LINK,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=timeout_sec),
+            )
+            t = tf.transform.translation
+            return [t.x, t.y, t.z]
+        except Exception as exc:
+            self._node.get_logger().warn(f"_get_current_eef_pos: TF lookup failed: {exc}")
+            return None
+
     def _make_pre_grasp_pose(self, grasp_pose: Pose, lift_m: float = 0.12) -> Pose:
         """Return a pose `lift_m` above the grasp pose (pre-grasp approach)."""
         pre = deepcopy(grasp_pose)
@@ -367,3 +452,31 @@ class ArmPrimitive:
 
     def _log(self, msg: str) -> None:
         self._node.get_logger().info(f"[{self.__class__.__name__}] {msg}")
+
+    def _log_eef(self, label: str) -> None:
+        """Log EEF pose (TF) and joint angles at the given step label."""
+        if self._tf_buffer is not None:
+            try:
+                from rclpy.time import Time
+                t = self._tf_buffer.lookup_transform("panda_link0", "panda_hand", Time())
+                r = t.transform.rotation
+                p = t.transform.translation
+                self._log(
+                    f"  [DBG {label}] EEF pos=({p.x:.3f},{p.y:.3f},{p.z:.3f}) "
+                    f"quat=({r.x:.3f},{r.y:.3f},{r.z:.3f},{r.w:.3f})"
+                )
+            except Exception as e:
+                self._log(f"  [DBG {label}] TF lookup failed: {e}")
+
+        try:
+            msg = self._last_joint_state
+            if msg is not None:
+                panda_joints = [
+                    (msg.name.index(f"panda_joint{i}"), i)
+                    for i in range(1, 8)
+                    if f"panda_joint{i}" in msg.name
+                ]
+                vals = [f"j{i}={msg.position[idx]:.2f}" for idx, i in panda_joints]
+                self._log(f"  [DBG {label}] joints: {' '.join(vals)}")
+        except Exception as e:
+            self._log(f"  [DBG {label}] joint_states failed: {e}")

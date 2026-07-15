@@ -113,7 +113,7 @@ def main():
     # ── Step 3: Primitive dispatch (mock) ──────────────────────────────────────
     print("\n[Executor] Dispatching primitives (mock):")
     for i, p in enumerate(primitives, 1):
-        print(f"  {i}. → {p.name}({', '.join(p.args)})")
+        print(f"  {i}. → {p.name}({', '.join(str(a) for a in p.args)})")
 
     print("\n[Done] Pipeline completed (mock execution).")
 

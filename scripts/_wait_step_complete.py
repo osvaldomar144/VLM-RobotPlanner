@@ -9,7 +9,7 @@ Used by run_loop_host.py to synchronize the closed loop:
   host injects step → waits → reads result → decides next step
 
 Output (stdout, JSON):
-    {"step": 0, "primitive": "pick", "success": true, "task_complete": false}
+    {"step": 0, "primitive": "pick", "success": true, "task_complete": false, "seq": 3}
 
 Exit codes:
     0 — received completion signal
@@ -30,11 +30,13 @@ from std_msgs.msg import String
 
 
 class _WaitNode(Node):
-    def __init__(self) -> None:
+    def __init__(self, min_seq: int = 0) -> None:
         super().__init__("_wait_step_complete")
         self.result: dict | None = None
+        self._min_seq = min_seq
         # TRANSIENT_LOCAL matches publisher QoS — receives last message even if
         # published before this subscriber was created (race condition fix).
+        # Stale messages are filtered by min_seq: only accept seq >= min_seq.
         from rclpy.qos import QoSProfile, DurabilityPolicy
         _latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(
@@ -48,7 +50,12 @@ class _WaitNode(Node):
         if self.result is not None:
             return
         try:
-            self.result = json.loads(msg.data)
+            data = json.loads(msg.data)
+            # Filter stale latched messages from previous steps.
+            # seq field added by orchestrator; older messages without seq are stale.
+            if data.get("seq", 0) < self._min_seq:
+                return
+            self.result = data
         except Exception:
             pass
 
@@ -61,17 +68,20 @@ class _WaitNode(Node):
             self.result = {
                 "step": -1, "primitive": "unknown",
                 "success": False, "task_complete": False,
-                "error": msg.data,
+                "error": msg.data, "seq": self._min_seq,
             }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--min-seq", type=int, default=0,
+                        help="Ignore step_complete messages with seq < this value "
+                             "(filters stale latched messages from previous steps)")
     args = parser.parse_args()
 
     rclpy.init()
-    node     = _WaitNode()
+    node     = _WaitNode(min_seq=args.min_seq)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 

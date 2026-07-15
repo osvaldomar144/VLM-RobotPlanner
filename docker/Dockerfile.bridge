@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.bridge — ROS 1 ↔ ROS 2 bridge container
+#
+# Ubuntu 20.04 is the only LTS release that supports both ROS Noetic and
+# ROS 2 Foxy natively via apt, which is required to build ros1_bridge.
+#
+# This container connects the real Franka robot (running ROS 1 Noetic) to
+# the ROS 2 Humble planning stack in the vlm_ros2 container. Both containers
+# use network_mode: host, so bridged topics appear on DDS domain 42 and are
+# immediately visible to the Humble orchestrator and MoveIt 2 nodes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Rome
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl gnupg2 lsb-release ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── ROS 1 Noetic ─────────────────────────────────────────────────────────────
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc \
+      | apt-key add - \
+ && echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main" \
+      > /etc/apt/sources.list.d/ros1.list
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-noetic-ros-base \
+    ros-noetic-sensor-msgs \
+    ros-noetic-geometry-msgs \
+    ros-noetic-trajectory-msgs \
+    ros-noetic-control-msgs \
+    ros-noetic-actionlib-msgs \
+    # franka_msgs provides FrankaState and ErrorRecoveryAction used by franka_ros.
+    # Comment this line out if the robot's roscore does not publish franka_msgs.
+    ros-noetic-franka-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── ROS 2 Foxy (Ubuntu 20.04 native) ─────────────────────────────────────────
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc \
+      | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+      http://packages.ros.org/ros2/ubuntu $(lsb_release -sc) main" \
+      > /etc/apt/sources.list.d/ros2.list
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-foxy-ros-base \
+    ros-foxy-ros1-bridge \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/entrypoint_bridge.sh /entrypoint_bridge.sh
+RUN chmod +x /entrypoint_bridge.sh
+
+ENTRYPOINT ["/entrypoint_bridge.sh"]
+CMD ["dynamic"]

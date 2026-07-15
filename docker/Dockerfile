@@ -8,7 +8,12 @@ FROM osrf/ros:humble-desktop-full
 # Avoid interactive prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+# --allow-unauthenticated: GPG keys in the base image become invalid after
+# upstream key rotations (Ubuntu + ROS2). Acceptable for a dev/research container.
+RUN apt-get update \
+      -o Acquire::AllowInsecureRepositories=true \
+      -o Acquire::AllowDowngradeToInsecureRepositories=true \
+    && apt-get install -y --allow-unauthenticated --no-install-recommends \
     # Build tools
     python3-pip \
     python3-colcon-common-extensions \
@@ -24,6 +29,12 @@ RUN apt-get update && apt-get install -y \
     ros-humble-moveit-resources-panda-moveit-config \
     ros-humble-moveit-configs-utils \
     ros-humble-moveit-ros-move-group \
+    # pick_ik: PickNik's recommended IK solver for MoveIt2 on ROS2 Humble.
+    # mode=local uses gradient descent starting from the seed (current joint state),
+    # so Cartesian interpolation naturally selects nearby solutions — prevents
+    # joint-space jumps for non-standard EEF orientations (e.g. side grasp).
+    # (trac_ik_kinematics_plugin is not an apt package in Humble; build-from-source)
+    ros-humble-pick-ik \
     # Gazebo Classic 11 + ros2_control bridge
     ros-humble-gazebo-ros-pkgs \
     ros-humble-gazebo-ros2-control \

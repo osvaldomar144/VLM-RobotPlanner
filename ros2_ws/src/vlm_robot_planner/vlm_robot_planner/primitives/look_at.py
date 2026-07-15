@@ -24,8 +24,8 @@ _J0_MAX = 1.30   # ±75° clamp
 
 class LookAtPrimitive(ArmPrimitive):
 
-    def __init__(self, node: Node, moveit) -> None:
-        super().__init__(node, moveit)
+    def __init__(self, node: Node, moveit, tf_buffer=None) -> None:
+        super().__init__(node, moveit, tf_buffer=tf_buffer)
 
     def execute(self, target_name: str, pose_data: dict | None = None) -> bool:
         """

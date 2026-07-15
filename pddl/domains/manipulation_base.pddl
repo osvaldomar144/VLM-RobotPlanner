@@ -1,6 +1,5 @@
-; Domain template 1 — Base tabletop manipulation
+; Domain template 1: Base tabletop manipulation
 ; Use when: flat surfaces only, no stacking, no containers, no navigation.
-; Phase: 1
 ; Primitives covered: pick, place, look_at
 
 (define (domain manipulation-base)
@@ -13,10 +12,10 @@
 
   (:predicates
     (on ?i - item ?l - location)         ; item rests on a surface
-    (clear ?i - item)                    ; nothing on top — always true in this template
+    (clear ?i - item)                    ; nothing on top - always true in this template
     (holding ?i - item)                  ; gripper holds this item
     (gripper-empty)                      ; gripper is free
-    (reachable ?l - location)            ; location is within arm reach
+    (reachable ?o - object)              ; object (item or location) is within arm reach
     (camera-aimed-at ?i - item)          ; wrist camera oriented toward item
   )
 

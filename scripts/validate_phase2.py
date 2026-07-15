@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-validate_phase2.py — Validazione approccio ibrido Phase 2 (senza pipeline ROS).
+validate_phase2.py — Phase 2 hybrid approach validation (no ROS pipeline).
 
-Esegue sul host:
-  1. VLM → piano con bbox
-  2. VLM-bbox → 3D pose per pick target (ray-plane intersection)
-  3. GroundingDINO → 3D pose per place location
-  4. Oracle Gazebo → pose ground-truth per confronto errore
-  5. Debug image annotata + report testo
+Runs on the host:
+  1. VLM → plan with bbox
+  2. VLM-bbox → 3D pose for pick target (ray-plane intersection)
+  3. GroundingDINO → 3D pose for place location
+  4. Gazebo oracle → ground-truth poses for error comparison
+  5. Annotated debug image + text report
 
-Uso:
+Usage:
     source .venv/bin/activate
-    python3 scripts/validate_phase2.py \
-        --task "pick the hammer and place it on the yellow tray" \
+    python3 scripts/validate_phase2.py \\
+        --task "pick the hammer and place it on the yellow tray" \\
         [--image data/scene.png]  [--no-oracle]
 """
 from __future__ import annotations
@@ -32,8 +32,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 _ROBOT_BASE_WORLD = np.array([0.20, 0.0, 0.770])   # panda_link0 in world frame
 
-# Hardcoded oracle (panda_link0 = world - robot_base)
-# Usato come fallback quando Gazebo non risponde
+# Hardcoded oracle poses (panda_link0 = world - robot_base).
+# Fallback when Gazebo is unreachable.
 _ORACLE_HARDCODED = {
     # ── workshop ──────────────────────────────────────────────────────────────
     "hammer":         {"x": 0.550, "y":  0.017, "z": 0.025},
@@ -211,7 +211,7 @@ def main():
     print(f"  Task: {args.task}")
     print(f"{'='*60}\n")
 
-    # ── Carica immagine e calibrazione ────────────────────────────────────────
+    # ── Load image and camera calibration ────────────────────────────────────
     img_path = _REPO_ROOT / args.image
     if not img_path.exists():
         sys.exit(f"[ERROR] {img_path} non trovato. Esegui prima _capture_scene.py")
@@ -262,7 +262,7 @@ def main():
     target_for_dino = (place_loc or pick_target or "").replace("_", " ")
     print(f"\n[3/4] Confronto approcci su '{target_for_dino}'")
 
-    # A) GroundingDINO standalone (immagine intera)
+    # A) GroundingDINO standalone (full image)
     dino_pose_full, dino_det_full = grounding_dino_pose(
         target_for_dino, image, K, cam_to_base, threshold=0.12)
     if dino_pose_full:
@@ -290,7 +290,7 @@ def main():
         else:
             print(f"  B) DINO in VLM-ROI:    non rilevato nel ROI")
 
-    # C) Place location con VLM location_bbox o DINO
+    # C) Place location using VLM location_bbox or DINO
     dino_loc_pose, dino_loc_det = None, None
     if step.primitive == "place" and place_loc:
         loc_q = place_loc.replace("_", " ")
@@ -323,7 +323,7 @@ def main():
                 oracle_poses[name] = _ORACLE_HARDCODED[name]
                 print(f"  {name:20s}: ({_ORACLE_HARDCODED[name]['x']:.3f},{_ORACLE_HARDCODED[name]['y']:.3f}) [hardcoded]")
 
-    # ── Report errori ─────────────────────────────────────────────────────────
+    # ── Validation results ────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
     print("  RISULTATI VALIDAZIONE")
     print(f"{'─'*60}")
@@ -369,7 +369,7 @@ def main():
             lbl += f" err={error_m(vlm_pose_est,gt)*100:.0f}cm"
         draw.text((b[0], max(0,b[1]-14)), lbl, fill="lime")
 
-    # DINO standalone (rosso — alta visibilità)
+    # DINO standalone (red — high visibility)
     if dino_det_full:
         b = dino_det_full["box"]
         draw.rectangle([b[0],b[1],b[2],b[3]], outline="red", width=lw)
@@ -380,7 +380,7 @@ def main():
             lbl += f" err={error_m(dino_pose_full,gt)*100:.0f}cm"
         draw.text((b[0], max(0,b[3]+2)), lbl, fill="red")
 
-    # DINO in ROI cascade (cyan, più spesso)
+    # DINO in ROI cascade (cyan, thicker stroke)
     if dino_det_roi:
         b = dino_det_roi["box"]
         draw.rectangle([b[0],b[1],b[2],b[3]], outline="cyan", width=lw + 1)

@@ -127,6 +127,45 @@ def _read_overview_pose_from_world(world_name: str):
     return None
 
 
+def _get_scene_objects(world_name: str) -> list[str]:
+    """
+    Read all named objects from the world SDF and return their names.
+    Used to inject the exact object names into the VLM prompt so the model
+    generates correct oracle-compatible names regardless of task wording.
+    Skips structural models (walls, floor, pedestal, cameras, furniture).
+    """
+    import xml.etree.ElementTree as ET
+    _SKIP = {
+        "sun", "ground_plane", "floor", "room", "wall_back", "wall_left",
+        "wall_right", "robot_pedestal", "overview_camera", "ceiling_lamp",
+        "wall_cabinet_l", "wall_cabinet_r", "fridge", "stove", "kitchen_table",
+        "chair_north", "chair_south", "chair_east", "counter", "workbench",
+        "desk", "side_table", "laptop_stand", "monitor_stand", "cabinet",
+        "shelf_b", "bookshelf", "sofa", "plant", "trash_can", "office_chair",
+        "coffee_table", "safety_cone",
+    }
+    world_path = (Path(__file__).resolve().parent.parent /
+                  "ros2_ws/src/vlm_robot_planner_bringup/worlds" /
+                  f"{world_name}.world")
+    if not world_path.exists():
+        return []
+    try:
+        tree = ET.parse(str(world_path))
+        names = []
+        for model in tree.iter("model"):
+            n = model.get("name", "")
+            if n and n not in _SKIP:
+                names.append(n)
+        for inc in tree.iter("include"):
+            name_el = inc.find("name")
+            n = name_el.text.strip() if name_el is not None and name_el.text else ""
+            if n and n not in _SKIP:
+                names.append(n)
+        return sorted(set(names))
+    except Exception:
+        return []
+
+
 def _get_overview_cam_data(world_name: str = "office"):
     """
     Compute K and cam_to_base for the OVERVIEW camera.
@@ -179,9 +218,20 @@ def _get_overview_cam_data(world_name: str = "office"):
         R_world_to_cam = R_C_G @ R_W_G.T   # world → OpenCV camera
 
         # ── cam_to_base (camera → panda_link0) ───────────────────────────────
-        # world and panda_link0 share orientation (just translated)
+        # Real robot: prefer the TF-based pose saved by _capture_scene.py.
+        # Simulation: fall back to computing it from the world SDF pose.
+        from pathlib import Path as _Path2
+        import json as _json2
+        _ov_pose_path = _Path2(__file__).resolve().parent.parent / "data" / "overview_camera_pose.json"
+        if _ov_pose_path.exists():
+            with open(str(_ov_pose_path)) as _f2:
+                cam_to_base = np.array(_json2.load(_f2)["cam_to_base"])
+            print("[INFO] Overview cam_to_base from overview_camera_pose.json (TF-based)")
+            return K, cam_to_base
+
+        # Simulation fallback: compute from SDF pose
         R_cam_to_world = R_world_to_cam.T
-        cam_pos_in_base = _POS - _ROBOT_BASE   # (0.80, 0.70, 0.730)
+        cam_pos_in_base = _POS - _ROBOT_BASE
 
         cam_to_base = np.eye(4)
         cam_to_base[:3, :3] = R_cam_to_world
@@ -247,10 +297,8 @@ def _annotate_handled_objects(
             v = int(K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2])
             if not (CS <= u < W - CS and CS <= v < H - CS):
                 continue
-            # Horizontal and vertical lines of the cross
             draw.line([u - CS, v, u + CS, v], fill=(0, 220, 0), width=2)
             draw.line([u, v - CS, u, v + CS], fill=(0, 220, 0), width=2)
-            # Small number next to cross
             draw.text((u + CS + 1, v - CS), str(i), fill=(0, 220, 0))
 
     # ── 2. Text legend box in top-left corner ────────────────────────────────
@@ -259,7 +307,6 @@ def _annotate_handled_objects(
     lines = ["DONE:"] + [f" {i}. {n}" for i, n in enumerate(placed_at, 1)]
     box_w = max(len(l) for l in lines) * 7 + PAD * 2
     box_h = len(lines) * LH + PAD * 2
-    # Dark background
     draw.rectangle([2, 2, box_w, box_h], fill=(0, 60, 0))
     draw.rectangle([2, 2, box_w, box_h], outline=(0, 200, 0), width=1)
     for i, line in enumerate(lines):
@@ -270,14 +317,20 @@ def _annotate_handled_objects(
 
 
 def _publish_perception_pose(
-    args, object_name: str, x: float, y: float, z: float
+    args, object_name: str, x: float, y: float, z: float,
+    height_m: float | None = None,
 ) -> bool:
-    """Publish a perception-estimated pose to /perception/object_pose."""
+    """Publish a perception-estimated pose to /perception/object_pose.
+
+    height_m: estimated object height in metres (from _estimate_object_height).
+              Encoded in orientation.z; None → 0.0 → orchestrator uses fallback.
+    """
+    height_arg = f" --height_m {height_m:.4f}" if height_m is not None else ""
     bash_cmd = (
         "source /opt/ros/humble/setup.bash && "
         "source /workspace/ros2_ws/install/setup.bash && "
         f"python3 /workspace/scripts/_publish_perception_pose.py "
-        f"--object {object_name} --x {x:.6f} --y {y:.6f} --z {z:.6f}"
+        f"--object {object_name} --x {x:.6f} --y {y:.6f} --z {z:.6f}{height_arg}"
     )
     r = _run_in_container(args, bash_cmd, timeout=10)
     for line in r.stdout.decode().strip().splitlines():
@@ -285,59 +338,50 @@ def _publish_perception_pose(
     return r.returncode == 0
 
 
-def _run_perception(
-    args,
-    target_name: str,
-    perception,
-    obj_z_base: float = 0.025,
-) -> bool:
+def _estimate_object_height(
+    detection: dict | None,
+    obj_xyz: tuple,
+    K,
+    ctb,
+) -> float | None:
+    """Estimate object height from DINO bbox using the pinhole model.
+
+    H ≈ bbox_height_px × dist(camera, object) / fy
+
+    Works for both overview camera and wrist camera (ctb changes with arm pose).
+    Phase 2 improvement: replace with depth-channel measurement from RealSense
+    (sample depth at multiple rows of the bbox → more accurate, handles tilt).
+
+    Returns None if inputs are unavailable or the estimate is out of range.
     """
-    Phase 2: after look_at, capture wrist-camera frame and estimate 3D pose
-    via GroundingDINO. Publishes to /perception/object_pose.
-    Orchestrator prefers this over oracle when cache is fresh.
-    Phase 4 (real robot): same flow, RealSense depth replaces ray-plane z.
+    if detection is None or K is None or ctb is None:
+        return None
+    try:
+        bbox_h_px = detection["box"][3] - detection["box"][1]   # y2 - y1
+        if bbox_h_px < 5:   # < 5 pixels → unreliable
+            return None
+        cam_origin = ctb[:3, 3]                                 # camera in panda_link0
+        dist = float(_np.linalg.norm(_np.array(obj_xyz) - cam_origin))
+        fy = float(K[1, 1])
+        h = bbox_h_px * dist / fy
+        return h if 0.02 < h < 0.60 else None   # sanity: 2 cm – 60 cm
+    except Exception:
+        return None
+
+
+
+
+def _wait_step_complete(args, timeout: int = 60, min_seq: int = 0) -> dict:
+    """Wait for step completion signal from orchestrator.
+
+    min_seq: ignore step_complete messages with seq < this value, preventing
+    stale TRANSIENT_LOCAL (latched) messages from previous steps being accepted
+    as the result of the current step.
     """
-    from vlm.perception import PerceptionModule
-    from PIL import Image as PilImage
-
-    print("[LOOP] Phase 2: capturing from scan pose…")
-    fresh_path = _capture(args)
-    if fresh_path is None:
-        print("[WARN] Phase 2: capture failed — oracle will be used as fallback")
-        return False
-    obs_image = PilImage.open(fresh_path).convert("RGB")
-
-    data_dir = str(_REPO_ROOT / "data")
-    cam_data = PerceptionModule.load_camera_data(data_dir)
-    if cam_data is None:
-        print("[LOOP] Phase 2: camera calibration not available")
-        return False
-
-    K, cam_to_base = cam_data
-    print(f"[LOOP] Phase 2: GroundingDINO → get_pose('{target_name}')")
-    pose = perception.get_pose(target_name, obs_image, K, cam_to_base,
-                               obj_z_base=obj_z_base)
-
-    if pose is None:
-        print(f"[WARN] Phase 2: '{target_name}' not detected — oracle will be used as fallback")
-        return False
-
-    print(
-        f"[LOOP] Phase 2: '{target_name}' → "
-        f"({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f}) panda_link0"
-    )
-    ok = _publish_perception_pose(args, target_name, pose["x"], pose["y"], pose["z"])
-    if ok:
-        print("[OK]   Phase 2: pose published → orchestrator will prefer it over oracle")
-    return ok
-
-
-def _wait_step_complete(args, timeout: int = 60) -> dict:
-    """Wait for step completion signal from orchestrator."""
     bash_cmd = (
         "source /opt/ros/humble/setup.bash && "
         "source /workspace/ros2_ws/install/setup.bash && "
-        f"python3 /workspace/scripts/_wait_step_complete.py --timeout {timeout}"
+        f"python3 /workspace/scripts/_wait_step_complete.py --timeout {timeout} --min-seq {min_seq}"
     )
     r = _run_in_container(args, bash_cmd, timeout=timeout + 5)
     if r.returncode == 0:
@@ -358,7 +402,6 @@ def main() -> None:
                         help="Active Gazebo world (reads overview cam pose from world file)")
     args = parser.parse_args()
 
-    # Load VLM once
     print("[LOOP] Loading VLM (Qwen3-VL-8B-Instruct)…")
     from vlm.planner import VLMPlanner
     from vlm.perception import PerceptionModule
@@ -378,14 +421,12 @@ def main() -> None:
     _last_failed_step   = None   # step that caused last replan
     _replan_count       = 0      # how many times we've replanned
 
-    # Create a unique run directory for debug images
     import datetime
     _ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     _world_tag = getattr(args, "world", "unknown")
     _task_tag  = args.task[:30].replace(" ", "_").replace("/", "-")
     _RUN_DIR   = _REPO_ROOT / "data" / "runs" / f"{_ts}_{_world_tag}_{_task_tag}"
     _RUN_DIR.mkdir(parents=True, exist_ok=True)
-    # Save run metadata
     with open(str(_RUN_DIR / "run_info.txt"), "w") as _rf:
         _rf.write(f"timestamp: {_ts}\n")
         _rf.write(f"world:     {_world_tag}\n")
@@ -399,14 +440,18 @@ def main() -> None:
     else:
         print("[WARN] Overview camera calibration failed — using wrist cam for VLM")
 
-    # Spatial exclusion: track where objects have been placed.
-    # After place(X, loc), the location position is marked as occupied by X.
-    # New DINO detections within EXCL_RADIUS of an occupied position are skipped
-    # to avoid re-picking already-handled objects.
-    # Key: VLM object name; Value: (x, y) of the place destination.
+    # Tracks destinations of placed objects; new DINO detections within
+    # EXCL_RADIUS of a recorded position are skipped to prevent re-picking.
     _placed_at: dict[str, tuple[float, float]] = {}
     _last_dino_est: dict[str, tuple[float, float]] = {}  # last DINO estimate per name
     _EXCL_RADIUS = 0.10  # 10cm — objects within this radius are treated as identical
+    # Tracks the last dispatch_seq; _wait_step_complete uses min_seq=_last_seq+1
+    # to ignore stale TRANSIENT_LOCAL (latched) messages from previous steps.
+    _last_seq: int = -1
+    # Persists domain enrichments across iterations. The VLM enriches the domain
+    # only when it first encounters a novel action; subsequent iterations omit it.
+    # generate_problem needs the accumulated definitions to infer the PDDL goal.
+    _accumulated_da: dict = {}
 
     for iteration in range(args.max_steps):
         print(f"\n{'─'*60}")
@@ -434,7 +479,7 @@ def main() -> None:
             break
         image = PilImage.open(image_path).convert("RGB")
 
-        # Save iteration snapshot (wrist cam) — in run dir, per-iter subfolder added later
+        # Wrist snapshot saved here temporarily; moved into the iter subfolder at debug-save time
         iter_path = _RUN_DIR / f"iter_{iteration+1:02d}_wrist.png"
         image.save(str(iter_path))
         print(f"[LOOP] Snapshot: {iter_path.name}")
@@ -502,23 +547,49 @@ def main() -> None:
             print(f"[LOOP] Annotated image [{src}]: {annot_path.name} "
                   f"({len(_placed_at)} marker(s): {list(_placed_at.keys())})")
 
-        # ── VLM Planning: sempre con immagine corrente (come nel paper) ─────────
-        # La VLM riceve SEMPRE l'immagine attuale + storia completed_steps.
-        # Genera il piano COMPLETO rimanente → verifica stato + adatta se necessario.
-        # Questo allinea con il paper: ogni passo è preceduto da osservazione visiva.
-        # Se lo stato è cambiato inaspettatamente, il piano generato sarà diverso.
+        # Each iteration: VLM receives the current image and generates the full remaining plan.
+        # If the scene state changed unexpectedly, the plan will differ from the previous iteration.
         t_vlm = time.time()
         action_label = "REPLAN" if _last_failed_step else ("PLAN" if not vlm_context else "VERIFY+PLAN")
         print(f"[LOOP] VLM {action_label} (piano completo rimanente) per: '{args.task}'")
 
         _prev_plan_steps = [f"{s.primitive}({s.args})" for s in (_current_plan.steps if _current_plan else [])]
+        _prev_current_plan = _current_plan   # saved to inherit grasp_mode if VLM drops it
+
+        # Pass both overview (annotated) + wrist camera to the VLM.
+        # overview → global scene state with handled-object markers
+        # wrist    → close-up of current arm position / grip
+        _vlm_images = [image_for_vlm]
+        if image is not None and image is not image_for_vlm:
+            _vlm_images.append(image)
 
         _current_plan = vlm.plan_remaining(
-            args.task, [image_for_vlm], vlm_context,
+            args.task, _vlm_images, vlm_context,
             failed_step=_last_failed_step,
+            prior_enrichment=_accumulated_da if _accumulated_da else None,
         )
         _last_failed_step = None
         vlm_time = time.time() - t_vlm
+
+        # Preserve grasp_mode from previous plan if VLM omitted it during replanning.
+        # The VLM sometimes drops grasp_mode=side when updating the plan because it
+        # doesn't remember it specified it earlier. We inherit it so the correct
+        # physical grasp is preserved across iterations.
+        if _prev_current_plan and _current_plan.steps:
+            _prev_picks_by_obj = {
+                s.args.get("object", ""): s
+                for s in _prev_current_plan.steps
+                if s.primitive == "pick" and s.args.get("object")
+            }
+            for _s in _current_plan.steps:
+                if _s.primitive == "pick" and "grasp_mode" not in _s.args:
+                    _obj = _s.args.get("object", "")
+                    _prev_pick = _prev_picks_by_obj.get(_obj)
+                    if _prev_pick and "grasp_mode" in _prev_pick.args:
+                        _s.args = dict(_s.args)
+                        _s.args["grasp_mode"] = _prev_pick.args["grasp_mode"]
+                        print(f"[LOOP] Inherited grasp_mode='{_s.args['grasp_mode']}' "
+                              f"for pick('{_obj}') from previous plan")
         print(f"[LOOP] VLM inference    : {vlm_time:.1f}s")
 
         if _current_plan.steps:
@@ -548,6 +619,20 @@ def main() -> None:
         enriched = (da.get("new_predicates") or da.get("new_actions") or
                     da.get("new_types") or da.get("modified_preconditions"))
         if enriched:
+            # Persist enrichment: merge new_actions/predicates into accumulator so
+            # subsequent iterations can use them even when VLM says "no enrichment".
+            for key in ("new_types", "new_predicates", "new_actions", "modified_preconditions"):
+                if da.get(key):
+                    existing = _accumulated_da.get(key, [])
+                    existing_names = {
+                        a.get("name") for a in existing
+                        if isinstance(a, dict) and "name" in a
+                    }
+                    for item in da[key]:
+                        name = item.get("name") if isinstance(item, dict) else None
+                        if name not in existing_names:
+                            existing.append(item)
+                    _accumulated_da[key] = existing
             print(f"[LOOP] ⚡ DOMAIN ENRICHMENT:")
             if da.get("new_types"):
                 print(f"         new_types      : {da['new_types']}")
@@ -612,22 +697,17 @@ def main() -> None:
                 completed_steps.append(f"skip_place({step0.args.get('object','?')})")
                 continue
 
-        # Save iteration snapshot (no bbox overlay — bboxes removed from pipeline)
-        # The scene image is already saved as loop_iter_NN.png above.
-
-        # Phase 2: no grounding — VLM names used directly for DINO queries.
-        # ground_names() was for Phase 1 oracle lookup (Gazebo model names).
-        # In Phase 2, DINO takes any natural language query ("glass", "the cup")
-        # and finds the object. Consistent names across iterations = no mismatch.
+        # Phase 2: VLM object names are passed directly to DINO as queries.
+        # ground_names() was a Phase 1 step for oracle name matching and is no longer called.
         from copy import deepcopy
         plan_grounded = deepcopy(plan)
 
-        # 5c. Phase 2 — DINO ibrido: overview (globale) + wrist (raffinamento)
-        #
-        # OVERVIEW: vede TUTTO il workspace → nessun oggetto "cieco"
-        #   Usata per la stima iniziale di tutti gli oggetti nel passo corrente.
-        # WRIST (_run_perception dopo look_at): raffinamento close-up del pick target.
-        #   Fallback se overview non disponibile.
+        # 5c. DINO pose estimation — primary source is the overview camera.
+        # The overview D435i operates within its optimal depth range (0.8-1.5 m)
+        # with stable extrinsic calibration and a full view of the workspace.
+        # The wrist camera is not used as the DINO source: its ~0.3 m depth is
+        # borderline for D435i and hand-eye calibration is less reliable.
+        # Falls back to wrist camera if overview is unavailable.
         _data_dir = str(_REPO_ROOT / "data")
         step0 = plan_grounded.steps[0] if plan_grounded.steps else None
         if step0:
@@ -635,9 +715,9 @@ def main() -> None:
                 import numpy as _np
                 from vlm.perception import PerceptionModule
 
-                # Scegli sorgente per pre-step DINO
+                # Select primary camera source for DINO
                 if _using_overview and _OV_K is not None and _OV_CTB is not None:
-                    det_img_all   = image_vlm   # scene_overview.png — vede tutto
+                    det_img_all   = image_vlm   # scene_overview.png — full workspace view
                     det_K_all     = _OV_K
                     det_ctb_all   = _OV_CTB
                     src_label_all = "overview"
@@ -651,49 +731,170 @@ def main() -> None:
                         det_img_all = det_K_all = det_ctb_all = None
                         src_label_all = "none"
 
-                # Raccogli tutti i nomi oggetto nel passo corrente
+                # Collect object names referenced in the current step
                 names_to_estimate = {}
-                for _key in ("target", "object", "location"):
+                for _key in ("target", "object", "location", "container"):
                     _n = step0.args.get(_key, "")
                     if _n and _n not in _INFRA and _n not in names_to_estimate:
                         names_to_estimate[_n] = _key
 
+                # If currently holding an object, skip DINO for it regardless of step.
+                # The held object is inside the gripper and not visible in the overview.
+                # Identify it from the last pick(...) in completed_steps.
+                if holding:
+                    _held = next(
+                        (s[5:].split(",")[0].rstrip(")")
+                         for s in reversed(completed_steps)
+                         if s.startswith("pick(")),
+                        None,
+                    )
+                    if _held and _held in names_to_estimate:
+                        names_to_estimate.pop(_held)
+                        print(f"[LOOP] Holding '{_held}' — skip DINO (in gripper, not visible)")
+
+                _dino_detections = []
                 for name, name_key in names_to_estimate.items():
+                    # SIM-ONLY: fuzzy name match against Gazebo model names.
+                    # In simulation, Gazebo provides ground-truth poses for all models.
+                    # If the VLM name matches a Gazebo model name (substring), use that
+                    # pose directly — avoids DINO misidentifying large surfaces as locations
+                    # (e.g. "tray" detected as the whole counter → wrong 3D point).
+                    # On the real robot gazebo_poses is empty → this block never executes
+                    # and DINO is always used for all object localisation.
+                    _gz_name_match = None
+                    if gazebo_poses and name not in gazebo_poses:
+                        _name_lower = name.lower().replace("_", "")
+                        _candidates = []
+                        for _gz in gazebo_poses:
+                            _gz_lower = _gz.lower().replace("_", "")
+                            if _name_lower in _gz_lower or _gz_lower in _name_lower:
+                                _candidates.append(_gz)
+                        if len(_candidates) == 1:
+                            _gz_name_match = _candidates[0]
+                            _gp = gazebo_poses[_gz_name_match]
+                            _rbase = _np.array([0.20, 0.0])
+                            _resolved_pose = {
+                                "x": _gp["x"] - _rbase[0],
+                                "y": _gp["y"] - _rbase[1],
+                                "z": 0.025,
+                            }
+                            print(f"[LOOP] NameMatch: '{name}' → '{_gz_name_match}' "
+                                  f"(Gazebo pose, no DINO needed)")
+                            _resolved_xy = (_resolved_pose["x"], _resolved_pose["y"])
+                            _last_dino_est[name] = _resolved_xy
+                            _last_dino_est[_gz_name_match] = _resolved_xy  # also under PDDL name
+                            _publish_perception_pose(
+                                args, _gz_name_match,
+                                _resolved_pose["x"], _resolved_pose["y"], _resolved_pose["z"])
+                            step0.args = dict(step0.args)
+                            step0.args[name_key] = _gz_name_match
+                            continue  # skip DINO for this name
+
                     if det_img_all is None or det_K_all is None:
                         print(f"[LOOP] No camera for '{name}' — skip")
                         continue
+
+                    # Load depth array for real-robot depth-based unprojection.
+                    # Both wrist and overview cameras are RealSense D435i → both have depth.
+                    _depth_arr = None
+                    _depth_file = {
+                        "wrist":    _REPO_ROOT / "data" / "depth.npy",
+                        "overview": _REPO_ROOT / "data" / "depth_overview.npy",
+                    }.get(src_label_all)
+                    if _depth_file is not None and _depth_file.exists():
+                        try:
+                            _depth_arr = _np.load(str(_depth_file))
+                        except Exception:
+                            pass
+
                     pose_est = perception.get_pose(
                         name, det_img_all, det_K_all, det_ctb_all,
                         vlm_description=name.replace("_", " "),
+                        depth_image=_depth_arr,
                     )
+                    if perception._last_detection:
+                        _dino_detections.append(perception._last_detection.copy())
                     if pose_est:
-                        _last_dino_est[name] = (pose_est["x"], pose_est["y"])
                         print(f"[LOOP] DINO [{src_label_all}]: '{name}' → "
                               f"({pose_est['x']:.3f},{pose_est['y']:.3f},{pose_est['z']:.3f})")
-                        _publish_perception_pose(
-                            args, name, pose_est["x"], pose_est["y"], pose_est["z"])
-                        # Sim-only: risolvi VLM name → Gazebo model name per GazeboAttach
-                        if name not in gazebo_poses and step0.primitive in ("pick", "place"):
+
+                        # SIM-ONLY: snap DINO estimate to nearest Gazebo oracle position.
+                        # DINO correctly identifies which object, but its 3D projection
+                        # from a 2D image has cm-level errors → IK can fail on slightly
+                        # off positions. Oracle gives ground-truth → use it in sim.
+                        # On real robot gazebo_poses is empty → block never executes.
+                        _pub_x, _pub_y, _pub_z = pose_est["x"], pose_est["y"], pose_est["z"]
+                        _gz_resolved = None
+                        if gazebo_poses:
                             _rbase = _np.array([0.20, 0.0])
-                            _pxy   = _np.array([pose_est["x"], pose_est["y"]])
+                            _pxy   = _np.array([_pub_x, _pub_y])
                             _best_gz, _best_d = None, float("inf")
                             for _gz, _gp in gazebo_poses.items():
-                                _d = float(_np.linalg.norm(_pxy - (_np.array([_gp["x"], _gp["y"]]) - _rbase)))
+                                _d = float(_np.linalg.norm(
+                                    _pxy - (_np.array([_gp["x"], _gp["y"]]) - _rbase)))
                                 if _d < _best_d:
                                     _best_d, _best_gz = _d, _gz
                             if _best_gz and _best_d < 0.15:
-                                _publish_perception_pose(
-                                    args, _best_gz, pose_est["x"], pose_est["y"], pose_est["z"])
-                                step0.args = dict(step0.args)
-                                step0.args[name_key] = _best_gz
-                                print(f"[LOOP] GazeboAttach: '{name}' → '{_best_gz}' "
-                                      f"(dist={_best_d*100:.1f}cm, sim-only)")
+                                _gz_resolved = _best_gz
+                                _gp = gazebo_poses[_best_gz]
+                                _pub_x = _gp["x"] - _rbase[0]
+                                _pub_y = _gp["y"] - _rbase[1]
+                                # Oracle z = world z of model origin (typically object
+                                # centre) → converts to panda_link0 frame.
+                                # On real robot this block never runs (gazebo_poses empty).
+                                _pub_z = max(_gp.get("z", 0.770 + _pub_z) - 0.770, 0.0)
+                                print(f"[LOOP] SIM snap: "
+                                      f"DINO({pose_est['x']:.3f},{pose_est['y']:.3f},{pose_est['z']:.3f})"
+                                      f" → oracle '{_best_gz}' "
+                                      f"({_pub_x:.3f},{_pub_y:.3f},{_pub_z:.3f}) "
+                                      f"Δxy={_best_d*100:.1f}cm")
+
+                        _last_dino_est[name] = (_pub_x, _pub_y)
+                        # Estimate height from the raw DINO bbox even in sim: the oracle
+                        # snap overrides xyz, but _last_detection still holds the bbox.
+                        _height_m = _estimate_object_height(
+                            perception._last_detection,
+                            (_pub_x, _pub_y, _pub_z),
+                            det_K_all,
+                            det_ctb_all,
+                        )
+                        if _height_m is not None:
+                            print(f"[LOOP] height est: {_height_m*100:.1f} cm")
+                        _publish_perception_pose(
+                            args, name, _pub_x, _pub_y, _pub_z, height_m=_height_m)
+                        if _gz_resolved and _gz_resolved != name:
+                            _publish_perception_pose(
+                                args, _gz_resolved, _pub_x, _pub_y, _pub_z,
+                                height_m=_height_m)
+                            step0.args = dict(step0.args)
+                            step0.args[name_key] = _gz_resolved
                     else:
                         print(f"[LOOP] DINO [{src_label_all}]: '{name}' non rilevato — oracle fallback")
+
+                # Save DINO bounding-box overlay for this iteration
+                if _dino_detections and det_img_all is not None:
+                    try:
+                        from vlm.perception import PerceptionModule as _PM
+                        _ann = _PM.draw_detections(det_img_all, _dino_detections)
+                        _dino_path = _RUN_DIR / f"iter_{iteration+1:02d}_dino.png"
+                        _ann.save(str(_dino_path))
+                        print(f"[LOOP] DINO annotation saved: {_dino_path.name}")
+                    except Exception as _ae:
+                        print(f"[WARN] DINO annotation failed: {_ae}")
+
             except Exception as _pe:
                 print(f"[WARN] pre-step perception failed: {_pe}")
 
-        # 5b. RIMOSSO — bbox-ground sostituito da DINO-only (step 5c).
+        # Restore accumulated enrichment if current plan has none.
+        # VLM correctly omits enrichment for repeat iterations, but generate_problem
+        # needs the action definitions (e.g. pour effects) to infer the PDDL goal.
+        _cur_da = plan_grounded.domain_additions
+        _cur_enriched = (
+            _cur_da.get("new_predicates") or _cur_da.get("new_actions") or
+            _cur_da.get("new_types") or _cur_da.get("modified_preconditions")
+        )
+        if not _cur_enriched and _accumulated_da:
+            plan_grounded.domain_additions = _accumulated_da
 
         # Generate PDDL + save comprehensive debug info for this iteration
         pddl_str = ""
@@ -733,8 +934,8 @@ def main() -> None:
                 "world":           getattr(args, "world", "unknown"),
                 "completed_steps": completed_steps,
                 "vlm_time_s":      round(vlm_time, 2),
-                "full_remaining_plan": _full_plan_dict,   # tutti i passi rimanenti
-                "plan_raw":        _plan_raw_dict,        # solo il passo corrente
+                "full_remaining_plan": _full_plan_dict,   # all remaining steps
+                "plan_raw":        _plan_raw_dict,        # current step only
                 "plan_grounded":   _plan_grnd_dict,
                 "domain_template": plan.domain_template,
                 "domain_additions": plan.domain_additions,
@@ -748,7 +949,6 @@ def main() -> None:
             _iter_dir = _RUN_DIR / f"iter_{_iter_n:02d}"
             _iter_dir.mkdir(exist_ok=True)
 
-            # Save files
             (_iter_dir / "debug.json").write_text(
                 _dbg_json.dumps(_debug, indent=2, ensure_ascii=False))
             (_iter_dir / "full_remaining_plan.json").write_text(
@@ -776,10 +976,14 @@ def main() -> None:
         except Exception as _save_err:
             print(f"[WARN] Debug save failed: {_save_err}")
 
-        # 6. Serialize + inject — PDDL validates the step correctly because
-        # problem_generator now handles partial plans:
-        # - pick-only: goal = (holding obj)
-        # - place-only: init = (holding obj), no gripper-empty
+        # 6. Serialize + inject.
+        # Full PDDL pipeline (no direct flag): orchestrator runs FastDownward to
+        # validate the single-step plan before dispatch.  The problem_generator
+        # infers the live robot state from the VLM plan structure:
+        #   - pick steps   → object starts on a surface
+        #   - place steps without prior pick → arm is already holding the object
+        #   - pour/tilt steps without prior pick → arm is already holding the source
+        # This makes single-step validation correct for all mid-task states.
         payload = json.dumps({
             "command":  args.task,
             "vlm_plan": json.loads(plan_grounded.to_json()),
@@ -801,7 +1005,9 @@ def main() -> None:
 
         # 7. Wait for step completion
         print("[LOOP] Attendo completamento step...")
-        result = _wait_step_complete(args, timeout=60)
+        result = _wait_step_complete(args, timeout=60, min_seq=_last_seq + 1)
+        if "seq" in result:
+            _last_seq = result["seq"]
 
         # Build step description — include original VLM name + grounded PDDL name
         # so the VLM can match its own terminology with the completed action.
@@ -826,11 +1032,6 @@ def main() -> None:
 
             completed_steps.append(step_desc)
             print(f"[OK]   Step completato: {step_desc}")
-
-            # Phase 2: after look_at → DINO estimates 3D pose (wrist camera refinement)
-            if s0_grnd.primitive == "look_at":
-                target = s0_grnd.args.get("target", obj_orig)
-                _run_perception(args, target, perception)
 
             # Track place destinations for annotation markers
             if s0_orig.primitive == "place":
@@ -864,6 +1065,20 @@ def main() -> None:
         _rf.write(f"steps:     {completed_steps}\n")
         _rf.write(f"n_steps:   {len(completed_steps)}\n")
     print(f"[LOOP] Debug images saved in: {_RUN_DIR.relative_to(_REPO_ROOT)}")
+
+    # Generate self-contained HTML report for this run
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "_generate_report",
+            str(_REPO_ROOT / "scripts" / "_generate_report.py"),
+        )
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _report = _mod.generate_html_report(_RUN_DIR)
+        print(f"[LOOP] Report HTML: {_report.relative_to(_REPO_ROOT)}")
+    except Exception as _re:
+        print(f"[WARN] Report generation failed: {_re}")
 
 
 if __name__ == "__main__":

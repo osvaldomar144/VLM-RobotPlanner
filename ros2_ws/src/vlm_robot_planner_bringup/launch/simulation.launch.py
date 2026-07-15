@@ -101,10 +101,11 @@ def generate_launch_description() -> LaunchDescription:
             )
         )
         .robot_description_kinematics(
-            file_path=str(
-                get_package_share_path("moveit_resources_panda_moveit_config")
-                / "config" / "kinematics.yaml"
-            )
+            # Use our local kinematics.yaml (TRAC-IK Distance) instead of the
+            # KDL default from moveit_resources_panda_moveit_config.
+            # TRAC-IK prevents joint-space jumps in Cartesian paths for
+            # non-standard EEF orientations (e.g. side grasp mode).
+            file_path=os.path.join(bringup_share, "config", "kinematics.yaml")
         )
         .to_moveit_configs()
     )

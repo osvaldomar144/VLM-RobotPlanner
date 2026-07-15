@@ -162,9 +162,9 @@ def main() -> None:
         vlm.load()
         print("[OK]   VLM loaded.\n")
 
-        # ── Discover scene objects + poses from Gazebo ───────────────────────────
-        # Query /gazebo/model_states: returns names AND 3D positions.
-        # Used for (a) bbox-based spatial grounding and (b) OWL-ViT fallback.
+        # ── Discover scene objects from Gazebo ────────────────────────────────
+        # Query /gazebo/model_states for scene object names and positions.
+        # Used as a candidate list for visual name grounding (OWL-ViT / DINO).
         gazebo_models: list[str]       = []   # names only (for OWL-ViT fallback)
         gazebo_poses:  dict[str, dict] = {}   # name → {x,y,z} (for bbox grounding)
         if args.capture or not args.no_vlm:
@@ -186,12 +186,10 @@ def main() -> None:
             else:
                 print("[WARN] Could not query Gazebo model states — grounding disabled.")
 
-        # ── VLM inference: NO vocabulary hints (fully adaptive) ───────────────
-        # The VLM reasons from the image alone — it does NOT receive a list of
-        # known object names.  Names are corrected after inference via
-        # PerceptionModule visual grounding against the Gazebo scene objects.
-        # Modalità A (with hints) is still available via --items/--locations
-        # for comparison / ablation studies.
+        # ── VLM inference: no vocabulary hints (fully adaptive) ───────────────
+        # The VLM reasons from the image alone. Names are corrected post-inference
+        # via PerceptionModule grounding against Gazebo scene objects.
+        # The hint-based mode is still available via --items/--locations for ablation.
         scene_context = None
         if args.items or args.locations:
             scene_context = {"items": args.items, "locations": args.locations}
@@ -202,39 +200,12 @@ def main() -> None:
         print(f"[INFO] Running inference for: '{args.task}'")
         plan = vlm.plan(args.task, images, scene_context=scene_context)
 
-        # ── Visual grounding (two-tier) ───────────────────────────────────────
-        # Tier 1 (primary): bbox-based spatial grounding.
-        #   If the VLM output includes bbox/location_bbox fields, use camera
-        #   projection (world→pixel) to find which Gazebo model is at that
-        #   image location.  Fast, no neural network needed.
-        # Tier 2 (fallback): OWL-ViT name grounding.
-        #   If the VLM did not provide bboxes, use OWL-ViT to match names.
-        # Sim-to-real: Tier 1 works identically on the real robot — just swap
-        #   the 3D position source from oracle to RealSense depth.
+        # ── Visual grounding: name-based matching ─────────────────────────────
+        # Match VLM-generated object names to known scene objects using OWL-ViT.
         from vlm.perception import PerceptionModule
         perception = PerceptionModule()
 
-        # Bbox grounding is the correct architecture for Phase 2 (real robot +
-        # wrist camera eye-in-hand): the VLM generates accurate bboxes from a
-        # natural frontal perspective → spatial matching works reliably.
-        #
-        # For Phase 1 simulation the overview camera has a non-standard 3/4
-        # top-down perspective that causes the VLM to generate inaccurate bboxes.
-        # Bbox grounding is therefore DISABLED for simulation and will be enabled
-        # automatically when --use-bbox-grounding is passed (real robot flag).
-        use_bbox = args.use_bbox_grounding if hasattr(args, "use_bbox_grounding") else False
-
         grounded = False
-        if use_bbox and gazebo_poses:
-            plan_bbox = perception.ground_names_with_bbox(plan, gazebo_poses)
-            bbox_changed = any(
-                step.args != orig.args
-                for step, orig in zip(plan_bbox.steps, plan.steps)
-            )
-            if bbox_changed:
-                plan = plan_bbox
-                grounded = True
-
         if not grounded:
             vocab = args.items or gazebo_models
             locs  = args.locations if args.locations else gazebo_models
@@ -270,9 +241,9 @@ def main() -> None:
             print("  " + "\n  ".join(pddl_problem.splitlines()))
             print()
         except Exception as _e:
-            pass  # non-fatal: problema non generabile senza PDDL module
+            pass  # non-fatal: PDDL generation requires the planner module
 
-    # bbox VLM rimossi dal pipeline — nessuna debug image basata su bbox
+    # VLM bboxes are no longer used — no bbox-based debug images are generated
 
     # ── Serialize ─────────────────────────────────────────────────────────────
     payload = json.dumps({

@@ -3,32 +3,7 @@ Tests for the Pipeline class (planner/pipeline.py).
 
 No GPU, no ROS 2, no Fast Downward binary required.
 VLM and FastDownward are replaced by lightweight stubs so tests run instantly.
-
-How to read these tests
-───────────────────────
-Each test name describes EXACTLY what is being validated:
-
-  test_pipeline_success_end_to_end
-    → the full pipeline (all 5 stages) returns success=True and
-      produces a list of PrimitiveCall objects ready for dispatch
-
-  test_pipeline_fails_when_vlm_not_loaded
-    → if you forget to call load_vlm(), the pipeline catches it
-      gracefully and returns failure_stage="vlm"
-
-  test_pipeline_selects_correct_domain_file
-    → when VLMPlan.domain_template = "manipulation_stacking",
-      the pipeline opens manipulation_stacking.pddl from pddl/domains/
-
-  test_pipeline_repair_loop_retries_on_failure
-    → if FastDownward returns None (unsolvable), the pipeline retries
-      repair_retries times before giving up
-
-  test_showcase_*
-    → print-only tests; run with `pytest -s` to see formatted output
-
-Run with:
-    pytest tests/test_pipeline.py -v -s
+Showcase tests (test_showcase_*) print pipeline traces; run with pytest -s to see them.
 """
 
 import sys, os
@@ -110,9 +85,8 @@ def _make_pipeline(
 
 def test_pipeline_fails_when_vlm_not_loaded():
     """
-    What: Pipeline has no VLM loaded (vlm=None).
-    Expected: returns success=False, failure_stage="vlm", error message mentions load_vlm().
-    Why matters: prevents silent failures when the GPU model wasn't started.
+    Pipeline with vlm=None returns success=False, failure_stage="vlm", and an error
+    referencing load_vlm(). Prevents silent failures when the model was not started.
     """
     pipeline = Pipeline(vlm=None, fd_planner=_StubFD([]), domains_dir=DOMAINS_DIR)
     result = pipeline.run("pick the cup", images=[])
@@ -124,9 +98,8 @@ def test_pipeline_fails_when_vlm_not_loaded():
 
 def test_pipeline_accepts_precomputed_vlm_plan():
     """
-    What: caller passes a pre-built VLMPlan (skips VLM inference).
-    Expected: pipeline proceeds directly to stage 2 (enrichment).
-    Why matters: useful for dry-run tests and replaying stored plans.
+    A pre-built VLMPlan passed via vlm_plan= bypasses VLM inference.
+    Useful for dry-run tests and replaying stored plans.
     """
     plan = _make_plan()
     pipeline = _make_pipeline(plan=plan)
@@ -140,10 +113,8 @@ def test_pipeline_accepts_precomputed_vlm_plan():
 
 def test_pipeline_selects_correct_domain_file():
     """
-    What: VLMPlan.domain_template = "manipulation_stacking".
-    Expected: pipeline opens manipulation_stacking.pddl and the enriched domain
-              contains "manipulation-stacking".
-    Why matters: wrong domain → planner fails or produces invalid plans.
+    When domain_template="manipulation_stacking", the pipeline loads
+    manipulation_stacking.pddl. A wrong template would cause planning failure.
     """
     plan = _make_plan(template="manipulation_stacking")
     pipeline = _make_pipeline(plan=plan)
@@ -155,9 +126,8 @@ def test_pipeline_selects_correct_domain_file():
 
 def test_pipeline_applies_domain_enrichment():
     """
-    What: VLMPlan has domain_additions with a new predicate.
-    Expected: enrichment_result.domain_text contains the new predicate.
-    Why matters: this is the thesis innovation — verifies enrichment is applied.
+    VLM-suggested domain additions (new predicates) are applied before planning.
+    Core thesis innovation — verifies enrichment is wired into the pipeline.
     """
     plan = _make_plan()
     plan.domain_additions["new_predicates"] = ["(locked ?i - item)"]
@@ -169,10 +139,7 @@ def test_pipeline_applies_domain_enrichment():
 
 
 def test_pipeline_fails_on_missing_domain_file():
-    """
-    What: VLMPlan references a non-existent template name.
-    Expected: failure_stage="enrichment", error mentions the missing file.
-    """
+    """A non-existent template name causes failure_stage="enrichment"."""
     plan = _make_plan(template="nonexistent_template")
     pipeline = _make_pipeline(plan=plan)
     result = pipeline.run("pick", images=[], vlm_plan=plan)
@@ -185,9 +152,8 @@ def test_pipeline_fails_on_missing_domain_file():
 
 def test_pipeline_generates_pddl_problem():
     """
-    What: pipeline generates a PDDL problem from the VLMPlan.
-    Expected: pddl_problem contains the objects and goal from the plan.
-    Why matters: validates the ProblemGenerator is wired into the pipeline.
+    The generated PDDL problem contains the objects and goal extracted from the VLMPlan.
+    Validates that ProblemGenerator is wired into the pipeline.
     """
     plan = _make_plan()
     pipeline = _make_pipeline(plan=plan)
@@ -202,10 +168,8 @@ def test_pipeline_generates_pddl_problem():
 
 def test_pipeline_success_end_to_end():
     """
-    What: all 5 stages succeed — VLM → enrichment → problem → FD → parse.
-    Expected: success=True, primitives list contains pick and place,
-              repair_attempts=0.
-    Why matters: this is the golden path test.
+    All 5 stages succeed — VLM, enrichment, problem generation, FD, and parse.
+    Returns success=True with pick and place primitives and repair_attempts=0.
     """
     result = _make_pipeline().run("pick red cup", images=[], vlm_plan=_make_plan())
 
@@ -218,9 +182,8 @@ def test_pipeline_success_end_to_end():
 
 def test_pipeline_fails_when_fd_returns_no_plan():
     """
-    What: FastDownward returns None (problem is unsolvable).
-    Expected: success=False, failure_stage contains "planning" or "repair_exhausted".
-    Why matters: validates the pipeline handles unsolvable tasks gracefully.
+    FastDownward returning None (unsolvable problem) causes success=False.
+    failure_stage is "planning" or "repair_exhausted".
     """
     pipeline = _make_pipeline(fd_actions=None, repair_retries=0)
     result = pipeline.run("pick", images=[], vlm_plan=_make_plan())
@@ -230,11 +193,7 @@ def test_pipeline_fails_when_fd_returns_no_plan():
 
 
 def test_pipeline_repair_loop_retries_on_failure():
-    """
-    What: FastDownward always returns None. repair_retries=2.
-    Expected: FD is called 3 times (1 initial + 2 retries).
-    Why matters: validates the repair loop iteration count.
-    """
+    """With repair_retries=2 and FD always returning None, FD is called 3 times (1 initial + 2 retries)."""
     fd_stub = _StubFD(actions=None)
     pipeline = Pipeline(
         vlm=_StubVLM(_make_plan()),
@@ -250,11 +209,7 @@ def test_pipeline_repair_loop_retries_on_failure():
 
 
 def test_pipeline_repair_loop_stops_on_first_success():
-    """
-    What: FastDownward succeeds on the first attempt.
-    Expected: FD is called exactly once, repair_attempts=0.
-    Why matters: no unnecessary retries when plan is found immediately.
-    """
+    """FD is called exactly once when it succeeds on the first attempt; no unnecessary retries."""
     fd_stub = _StubFD(actions=["(pick red_cup source_red_cup)", "(place red_cup shelf_b)"])
     pipeline = Pipeline(
         vlm=_StubVLM(_make_plan()),
@@ -273,10 +228,8 @@ def test_pipeline_repair_loop_stops_on_first_success():
 
 def test_pipeline_normalizes_pddl_actions_to_primitives():
     """
-    What: FD returns "(unstack red_cup blue_box table_a)" (stacking template action).
-    Expected: normalize_to_primitives maps "unstack" → primitive name "pick".
-    Why matters: the robot only knows "pick" — not "unstack". Normalization
-                 bridges the PDDL action name and the robot primitive.
+    PDDL action "unstack" (from the stacking template) is normalized to primitive "pick".
+    The robot only knows the 7 primitives — normalization bridges the PDDL action name gap.
     """
     plan = _make_plan(template="manipulation_stacking")
     fd_stub = _StubFD(actions=[
@@ -298,11 +251,7 @@ def test_pipeline_normalizes_pddl_actions_to_primitives():
 # ── Domain file coverage ──────────────────────────────────────────────────────
 
 def test_all_domain_templates_resolve_to_existing_files():
-    """
-    What: for each entry in DOMAIN_TEMPLATE_FILES, the .pddl file exists.
-    Expected: all 4 files found in pddl/domains/.
-    Why matters: catches file renames or missing templates before runtime.
-    """
+    """All entries in DOMAIN_TEMPLATE_FILES resolve to existing .pddl files. Catches renames."""
     for template_name, filename in DOMAIN_TEMPLATE_FILES.items():
         path = DOMAINS_DIR / filename
         assert path.exists(), f"Missing domain file for template '{template_name}': {path}"
@@ -312,9 +261,8 @@ def test_all_domain_templates_resolve_to_existing_files():
 
 def test_pipeline_result_carries_all_intermediates():
     """
-    What: on success, PipelineResult contains all intermediate artifacts.
-    Expected: vlm_plan, enrichment_result, pddl_problem, pddl_actions are all set.
-    Why matters: thesis analysis and debugging require access to every stage's output.
+    On success, PipelineResult carries all intermediate artifacts (vlm_plan,
+    enrichment_result, pddl_problem, pddl_actions). Required for per-stage debugging.
     """
     result = _make_pipeline().run("pick", images=[], vlm_plan=_make_plan())
 
@@ -330,10 +278,7 @@ def test_pipeline_result_carries_all_intermediates():
 # ── ════════════════════════════════════════════════════════════════════════ ──
 
 def test_showcase_successful_pipeline(capsys):
-    """
-    Showcase: traces every stage of a successful base pick/place pipeline.
-    Shows exactly what each component receives and produces.
-    """
+    """Showcase: traces every stage of a successful base pick/place pipeline."""
     plan   = _make_plan()
     result = _make_pipeline(plan=plan).run("pick red cup", images=[], vlm_plan=plan)
 
@@ -358,10 +303,7 @@ def test_showcase_successful_pipeline(capsys):
 
 
 def test_showcase_enrichment_pipeline(capsys):
-    """
-    Showcase: pipeline with domain enrichment — locked object scenario.
-    Shows how the VLM's enrichment suggestion modifies the domain before planning.
-    """
+    """Showcase: domain enrichment with a locked-object scenario — VLM suggestion modifies the domain before planning."""
     plan = VLMPlan(
         goal="unlock and pick the locked screwdriver",
         steps=[

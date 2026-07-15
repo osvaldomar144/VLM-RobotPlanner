@@ -43,7 +43,6 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print raw VLM output")
     args = parser.parse_args()
 
-    # Resolve image paths
     if args.synthetic:
         synthetic_path = "/tmp/vlm_test_scene.jpg"
         image_paths = [make_synthetic_image(synthetic_path)]
@@ -58,7 +57,6 @@ def main():
     print(f"Task  : {args.task}")
     print(f"Images: {image_paths}\n")
 
-    # Load model
     from vlm.planner import VLMPlanner
     planner = VLMPlanner(model_name=args.model)
 
@@ -67,14 +65,12 @@ def main():
     planner.load()
     print(f"      Done in {time.time() - t0:.1f}s\n")
 
-    # Run inference
     print("[2/3] Running inference...")
     t1 = time.time()
     plan = planner.plan(args.task, image_paths)
     elapsed = time.time() - t1
     print(f"      Done in {elapsed:.1f}s\n")
 
-    # Report results
     print("[3/3] Results")
     print(f"  Goal : {plan.goal}")
     print(f"  Steps: {len(plan.steps)}")

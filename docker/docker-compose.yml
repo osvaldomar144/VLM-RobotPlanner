@@ -1,7 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Architecture:
-#   HOST  — VLM inference (Qwen3-VL) + pure-Python pipeline (GPU required)
-#   DOCKER — ROS 2 Humble + Gazebo Classic + MoveIt 2 + robot control
+#   HOST      — VLM inference (Qwen3-VL) + pure-Python pipeline (GPU required)
+#   ros2      — ROS 2 Humble + Gazebo Classic + MoveIt 2 + robot control (sim)
+#   ros1_bridge — ROS 1 ↔ ROS 2 bridge for real robot deployment (real profile)
+#
+# Profiles:
+#   (no profile / default)  →  simulation only: docker compose up
+#   real                    →  real robot:       docker compose --profile real up
 #
 # Communication:
 #   network_mode: host  →  ROS 2 DDS multicast is shared; topics visible on host
@@ -64,3 +69,27 @@ services:
     # Default: open a shell. Override to launch simulation directly:
     #   docker compose run ros2 ros2 launch vlm_robot_planner_bringup simulation.launch.py
     command: bash
+
+  # ── ROS 1 ↔ ROS 2 bridge (real robot only) ───────────────────────────────
+  # Activated with: docker compose --profile real up
+  # or via:         bin/start_bridge.sh --robot-ip <IP>
+  #
+  # ROS_MASTER_URI must point to the robot's roscore. Set it in the environment
+  # before starting, or pass it via bin/start_bridge.sh --robot-ip <IP>.
+  ros1_bridge:
+    profiles: ["real"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.bridge
+    image: vlm-ros1-bridge:latest
+    container_name: vlm_ros1_bridge
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - ROS_DOMAIN_ID=42
+      - ROS_IP=${ROS_IP:-}
+    volumes:
+      - ../docker:/workspace/docker:ro
+    restart: unless-stopped
+    command: dynamic

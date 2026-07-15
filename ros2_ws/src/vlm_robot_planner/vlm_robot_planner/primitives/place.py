@@ -49,8 +49,8 @@ class PlacePrimitive(ArmPrimitive):
                 physics drops it the remaining ~1 cm onto the surface.
     """
 
-    def __init__(self, node: Node, moveit, attach=None) -> None:
-        super().__init__(node, moveit)
+    def __init__(self, node: Node, moveit, attach=None, tf_buffer=None) -> None:
+        super().__init__(node, moveit, tf_buffer=tf_buffer)
         self._attach = attach
 
     def execute(self, location_name: str, pose_data: dict) -> bool:
@@ -65,6 +65,9 @@ class PlacePrimitive(ArmPrimitive):
         Returns:
             True if the full place sequence completed successfully.
         """
+        if pose_data is None:
+            self._log(f"place('{location_name}'): no pose available — aborting")
+            return False
         pos = pose_data["position"]
         self._log(f"place('{location_name}'): pos=({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
 
@@ -92,10 +95,9 @@ class PlacePrimitive(ArmPrimitive):
             self._log("place descend failed — aborting place")
             return False
 
-        # ── 3. Release: Boeing detach → ACO detach → open gripper ────────
-        # ORDER MATTERS with two-finger Boeing joints:
-        # detach BEFORE open_gripper so the fingers don't drag the cup
-        # sideways as they open (both fingers are rigidly linked to cup).
+        # ── 3. Release: GazeboAttach stop → ACO detach → open gripper ────
+        # Stop the 100Hz teleport timer before opening the gripper so the
+        # object stays at the place position while the fingers withdraw.
 
         # 3a. Simulation-only: release physics joints first
         if self._attach is not None:
@@ -104,7 +106,7 @@ class PlacePrimitive(ArmPrimitive):
         # 3b. Notify MoveIt2 that the object is released (W5)
         self.detach_object()
 
-        # 3c. Open gripper — fingers now free, cup already falling
+        # 3c. Open gripper — fingers now free to withdraw
         if not self.open_gripper():
             self._log("open_gripper failed during place — object may not be released")
 

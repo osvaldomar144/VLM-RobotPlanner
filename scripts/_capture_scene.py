@@ -38,6 +38,9 @@ _OVERVIEW_PATH        = "/workspace/data/scene_overview.png"
 _OVERVIEW_INFO_PATH   = "/workspace/data/overview_camera_info.json"
 _CAM_INFO_PATH        = "/workspace/data/camera_info.json"
 _CAM_POSE_PATH        = "/workspace/data/camera_pose.json"
+_DEPTH_PATH              = "/workspace/data/depth.npy"
+_DEPTH_OVERVIEW_PATH     = "/workspace/data/depth_overview.npy"
+_OVERVIEW_POSE_PATH      = "/workspace/data/overview_camera_pose.json"
 _TIMEOUT_SEC       = 8.0
 _TF_RETRIES        = 5
 _TF_RETRY_SLEEP    = 0.3
@@ -127,6 +130,23 @@ class _CaptureNode(Node):
             qos_profile_sensor_data,
         )
 
+        self.depth_saved = False
+        self.depth_overview_saved = False
+        # Wrist depth: sim uses /wrist_camera/depth/..., real robot uses bridged topic.
+        for depth_topic in ["/wrist_camera/depth/image_rect_raw",
+                             "/camera/depth/image_rect_raw"]:
+            self.create_subscription(
+                Image, depth_topic,
+                self._cb_depth,
+                qos_profile_sensor_data,
+            )
+        # Overview depth: same camera model (RealSense D435i), same depth channel.
+        self.create_subscription(
+            Image, "/overview_camera/depth/image_rect_raw",
+            self._cb_depth_overview,
+            qos_profile_sensor_data,
+        )
+
     def _cam_info_cb(self, msg: CameraInfo) -> None:
         if self._K is not None:
             return
@@ -168,6 +188,30 @@ class _CaptureNode(Node):
                     print(f"[WARN] TF lookup failed after {_TF_RETRIES} attempts: {exc}",
                           file=sys.stderr)
 
+    def _save_overview_camera_pose(self) -> None:
+        """Save overview camera extrinsic via TF lookup (static TF from launch file)."""
+        for attempt in range(_TF_RETRIES):
+            try:
+                tf = self._tf_buffer.lookup_transform(
+                    "panda_link0", "overview_camera_optical_frame", Time()
+                )
+                tr = tf.transform.translation
+                q  = tf.transform.rotation
+                R  = _quat_to_matrix(q.x, q.y, q.z, q.w)
+                mat = np.eye(4)
+                mat[:3, :3] = R
+                mat[:3,  3] = [tr.x, tr.y, tr.z]
+                with open(_OVERVIEW_POSE_PATH, "w") as f:
+                    json.dump({"cam_to_base": mat.tolist()}, f)
+                print(f"[OK] Overview camera pose saved: {_OVERVIEW_POSE_PATH}")
+                return
+            except Exception as exc:
+                if attempt < _TF_RETRIES - 1:
+                    time.sleep(_TF_RETRY_SLEEP)
+                else:
+                    print(f"[WARN] Overview TF lookup failed after {_TF_RETRIES} attempts: {exc}",
+                          file=sys.stderr)
+
     def _overview_cam_info_cb(self, msg: CameraInfo) -> None:
         if self._overview_K is not None:
             return
@@ -183,6 +227,34 @@ class _CaptureNode(Node):
             json.dump(data, f)
         print(f"[OK] Overview camera info saved: {_OVERVIEW_INFO_PATH}")
 
+    def _cb_depth(self, msg: Image) -> None:
+        """Save wrist camera depth image as uint16 numpy array (values in mm)."""
+        if self.depth_saved:
+            return
+        try:
+            arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(
+                msg.height, msg.width
+            )
+            np.save(_DEPTH_PATH, arr)
+            self.depth_saved = True
+            print(f"[OK] Depth saved: {_DEPTH_PATH} ({msg.width}×{msg.height})")
+        except Exception as exc:
+            print(f"[WARN] Depth save failed: {exc}", file=sys.stderr)
+
+    def _cb_depth_overview(self, msg: Image) -> None:
+        """Save overview camera depth image as uint16 numpy array (values in mm)."""
+        if self.depth_overview_saved:
+            return
+        try:
+            arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(
+                msg.height, msg.width
+            )
+            np.save(_DEPTH_OVERVIEW_PATH, arr)
+            self.depth_overview_saved = True
+            print(f"[OK] Depth overview saved: {_DEPTH_OVERVIEW_PATH} ({msg.width}×{msg.height})")
+        except Exception as exc:
+            print(f"[WARN] Depth overview save failed: {exc}", file=sys.stderr)
+
     def _cb_overview(self, msg: Image) -> None:
         """Save overview camera image — fixed external reference for VLM."""
         if self.overview_saved:
@@ -192,6 +264,7 @@ class _CaptureNode(Node):
             img.save(_OVERVIEW_PATH)
             self.overview_saved = True
             print(f"[OK] Overview saved: {_OVERVIEW_PATH} ({img.width}×{img.height})")
+            self._save_overview_camera_pose()
         except Exception:
             pass
 
@@ -222,7 +295,6 @@ def main() -> None:
     executor.add_node(node)
 
     t0 = time.time()
-    # Wait for wrist camera (primary) AND overview camera
     while (time.time() - t0) < _TIMEOUT_SEC:
         executor.spin_once(timeout_sec=0.1)
         if node.saved and node.overview_saved:

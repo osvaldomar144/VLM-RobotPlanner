@@ -1,0 +1,78 @@
+# bridge_topics.yaml — Topic mapping for ros1_bridge.
+#
+# ── When this file is used ────────────────────────────────────────────────────
+#   bin/start_bridge.sh --mode static   →  parameter_bridge, only topics listed here
+#   bin/start_bridge.sh                 →  dynamic_bridge (default), file ignored
+#
+# ── Action bridging — READ BEFORE CHOOSING STATIC MODE ───────────────────────
+#   ROS 1 ActionLib and ROS 2 actions are NOT the same protocol:
+#
+#     ROS 1 ActionLib exposes 5 plain topics per action:
+#       /ns/goal     /ns/cancel    /ns/status    /ns/feedback    /ns/result
+#
+#     ROS 2 actions expose 2 topics + 3 services per action:
+#       _action/feedback    _action/status    (topics)
+#       _action/send_goal   _action/cancel_goal   _action/get_result    (services)
+#
+#   parameter_bridge bridges individual topics — it cannot bridge services.
+#   Therefore it CANNOT fully bridge a ROS 1 action server to a ROS 2 action
+#   client. MoveIt 2 uses the ROS 2 action client interface; bridging only the
+#   raw sub-topics is not sufficient for it to send trajectory goals.
+#
+#   ► For arm control and gripper, always use dynamic mode (the default).
+#     dynamic_bridge registers type mappings from both ROS stacks at startup and
+#     creates a proper action bridge for known types (control_msgs, franka_msgs).
+#
+#   Static mode is safe and fully sufficient for sensor-only deployments
+#   (cameras, joint states, Franka state). All 5 action sub-topics are listed
+#   below as reference — they bridge correctly as plain topics but are not
+#   enough for full action protocol support.
+#
+# ── Direction notation ────────────────────────────────────────────────────────
+#   /topic@ros2_type[ros1_type   — ROS 2 subscriber → ROS 1 publisher  (ROS2→ROS1)
+#   /topic@ros2_type]ros1_type   — ROS 1 publisher  → ROS 2 subscriber (ROS1→ROS2)
+
+# ── Sensors: ROS 1 publishes → ROS 2 receives ─────────────────────────────────
+
+# Joint positions — MoveIt 2 state monitor and trajectory planning.
+/joint_states@sensor_msgs/msg/JointState]sensor_msgs/JointState
+
+# RealSense D435i (eye-in-hand) — color stream for VLM inference.
+/camera/color/image_raw@sensor_msgs/msg/Image]sensor_msgs/Image
+/camera/color/camera_info@sensor_msgs/msg/CameraInfo]sensor_msgs/CameraInfo
+
+# RealSense depth stream — ray-plane 3D pose estimation.
+/camera/depth/image_rect_raw@sensor_msgs/msg/Image]sensor_msgs/Image
+
+# Franka state — end-effector pose, joint torques, contact forces.
+# Requires ros-noetic-franka-msgs installed in the bridge container.
+/franka_state_controller/franka_states@franka_msgs/msg/FrankaState]franka_msgs/FrankaState
+
+# ── Arm controller action sub-topics (reference; dynamic mode for full action) ─
+# ROS 1 ActionLib topic names do NOT carry the "_action/" prefix.
+# Previous version of this file had "_action/feedback" etc. — that was wrong.
+
+# ROS 1 server → ROS 2 (server publishes these)
+/panda_arm_controller/follow_joint_trajectory/status@action_msgs/msg/GoalStatusArray]actionlib_msgs/GoalStatusArray
+/panda_arm_controller/follow_joint_trajectory/feedback@control_msgs/msg/FollowJointTrajectoryFeedback]control_msgs/FollowJointTrajectoryActionFeedback
+/panda_arm_controller/follow_joint_trajectory/result@control_msgs/msg/FollowJointTrajectoryResult]control_msgs/FollowJointTrajectoryActionResult
+
+# ROS 2 → ROS 1 server (client publishes these; not enough without send_goal service)
+/panda_arm_controller/follow_joint_trajectory/goal@control_msgs/msg/FollowJointTrajectoryGoal[control_msgs/FollowJointTrajectoryActionGoal
+/panda_arm_controller/follow_joint_trajectory/cancel@actionlib_msgs/msg/GoalID[actionlib_msgs/GoalID
+
+# ── Gripper action sub-topics (reference; dynamic mode for full action) ────────
+
+# franka_gripper/grasp
+/franka_gripper/grasp/status@action_msgs/msg/GoalStatusArray]actionlib_msgs/GoalStatusArray
+/franka_gripper/grasp/feedback@franka_msgs/msg/GraspFeedback]franka_msgs/GraspActionFeedback
+/franka_gripper/grasp/result@franka_msgs/msg/GraspResult]franka_msgs/GraspActionResult
+/franka_gripper/grasp/goal@franka_msgs/msg/GraspGoal[franka_msgs/GraspActionGoal
+/franka_gripper/grasp/cancel@actionlib_msgs/msg/GoalID[actionlib_msgs/GoalID
+
+# franka_gripper/move
+/franka_gripper/move/status@action_msgs/msg/GoalStatusArray]actionlib_msgs/GoalStatusArray
+/franka_gripper/move/feedback@franka_msgs/msg/MoveFeedback]franka_msgs/MoveActionFeedback
+/franka_gripper/move/result@franka_msgs/msg/MoveResult]franka_msgs/MoveActionResult
+/franka_gripper/move/goal@franka_msgs/msg/MoveGoal[franka_msgs/MoveActionGoal
+/franka_gripper/move/cancel@actionlib_msgs/msg/GoalID[actionlib_msgs/GoalID

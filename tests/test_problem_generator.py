@@ -297,10 +297,8 @@ def test_showcase_full_pipeline(capsys):
     parser = VLMPlanner.__new__(VLMPlanner)
     plan = parser._parse_output("pick locked screwdriver", vlm_json)
 
-    # Step 1: Generate PDDL problem
     problem_pddl = generate_problem(plan, problem_name="locked-screwdriver")
 
-    # Step 2: Enrich domain
     domain_path = Path(__file__).parent.parent / "pddl" / "domains" / "manipulation_base.pddl"
     enricher, base_domain = DomainEnricher.from_file(domain_path)
     result = enricher.enrich(base_domain, plan.to_domain_additions())

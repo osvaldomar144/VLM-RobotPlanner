@@ -1,6 +1,24 @@
 #!/bin/bash
 set -e
 
+# ── Pulizia shared memory stantia ────────────────────────────────────────────
+# Con ipc: host il container condivide /dev/shm con l'host. FastRTPS (ROS2 DDS)
+# crea file fastrtps_* e semafori sem.fastrtps_* per ogni partecipante DDS.
+# Se il container viene stoppato senza "docker compose down", questi file rimangono
+# con PID non più validi → il prossimo avvio trova semafori bloccati → deadlock.
+# Rimuovere i file orfani prima di avviare qualsiasi nodo ROS2 risolve il problema.
+for _f in /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_*; do
+    [ -e "$_f" ] || continue
+    # Estrai il PID dalla naming convention FastRTPS (solo per i file _el che
+    # contengono il PID del processo owning). Per i file senza PID nel nome,
+    # rimuoviamo sempre quelli che appartengono al dominio ROS_DOMAIN_ID corrente.
+    rm -f "$_f" 2>/dev/null || true
+done
+# Rimuovi anche eventuali socket/lock di Gazebo da run precedenti
+rm -f /tmp/.gazebo_master.lock 2>/dev/null || true
+rm -f /tmp/gazebo_*.lock 2>/dev/null || true
+# ─────────────────────────────────────────────────────────────────────────────
+
 source /opt/ros/humble/setup.bash
 
 # Overlay source-built gazebo_ros2_control (fixes long-URDF bug in Humble apt package)

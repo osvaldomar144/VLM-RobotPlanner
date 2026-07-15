@@ -42,11 +42,20 @@ Action parameter signatures (use EXACT variable names for modified_preconditions
 If no enrichment is needed, leave all domain_additions lists and dicts empty.
 
 ════════════════════════════════════════════════
-STEP 4 — PLAN (available primitives) + VISUAL GROUNDING
+STEP 4 — PLAN (available primitives)
 ════════════════════════════════════════════════
 Use ONLY these primitives in "steps":
 
-  pick(object)                — grasp the named object
+  pick(object, grasp_mode)    — grasp the named object
+      grasp_mode (optional, default "top_down"):
+        "top_down" — arm descends vertically from above; wrist is vertical.
+                     The object can only be lowered or raised — cannot be
+                     tilted or inverted from this grip.
+        "side"     — arm approaches horizontally; wrist is horizontal.
+                     Required when the subsequent action tilts, rotates, or
+                     inverts the object — the wrist must already be aligned
+                     for that rotation at the moment of grasping.
+        "handle"   — grip by the object's handle; for tools with a working end
   place(object, location)     — release object at location
   open_container(container)   — open a drawer or box lid
   close_container(container)  — close a drawer or box lid
@@ -55,16 +64,15 @@ Use ONLY these primitives in "steps":
   close_gripper()             — close gripper fingers directly
   say(text)                   — verbal output / status message
 
-VISUAL GROUNDING — for each physical object or surface referenced in a step,
-add a bounding box showing WHERE it is in the image.
-  - Use pixel coordinates: [x_min, y_min, x_max, y_max]
-  - Image dimensions: 640 × 480 pixels  (x: 0→639, y: 0→479)
-  - Add key "bbox"          for the grasped object (pick / look_at)
-  - Add key "location_bbox" for the placement surface (place)
-  - Omit bbox only if the object is not visible in the image.
+GRASP MODE: grasp_mode MUST be present in every pick step. For each pick,
+ask: "Does the action that follows require the object to be tilted, rotated,
+or inverted?" If yes: the wrist must already be aligned for that rotation at
+the moment of grasping — top_down (vertical wrist) cannot perform it; use
+"side" (horizontal wrist) to make the rotation mechanically possible.
+If no rotation is needed: use "top_down".
 
-This visual grounding replaces name-based object lookup: the robot finds the
-object by WHERE it appears in the image, not by what it is called.
+Use the exact object names you identified in STEP 1. Object localisation in
+the image is handled separately by the perception module — do NOT add bbox.
 
 ════════════════════════════════════════════════
 OUTPUT FORMAT — single JSON object, no markdown, no extra text
@@ -79,12 +87,12 @@ OUTPUT FORMAT — single JSON object, no markdown, no extra text
     "modified_preconditions": {}
   },
   "steps": [
-    {"primitive": "<name>", "args": {"<param>": "<value>", "bbox": [x1,y1,x2,y2], ...}},
+    {"primitive": "<name>", "args": {"<param>": "<value>", ...}},
     ...
   ]
 }
 
-Example — pick and place with visual grounding:
+Example — pick and place:
 {
   "goal": "pick the red cup and place it on the green shelf",
   "domain_template": "manipulation_base",
@@ -92,13 +100,12 @@ Example — pick and place with visual grounding:
     "new_types": [], "new_predicates": [], "new_actions": [], "modified_preconditions": {}
   },
   "steps": [
-    {"primitive": "pick",  "args": {"object": "red_cup",  "bbox": [220, 140, 285, 310]}},
-    {"primitive": "place", "args": {"object": "red_cup",  "location": "green_shelf",
-                                    "location_bbox": [355, 195, 465, 255]}}
+    {"primitive": "pick",  "args": {"object": "red_cup", "grasp_mode": "top_down"}},
+    {"primitive": "place", "args": {"object": "red_cup", "location": "green_shelf"}}
   ]
 }
 
-Example — scene with a locked box (domain enrichment + visual grounding):
+Example — scene with a locked box (domain enrichment):
 {
   "goal": "retrieve the screwdriver from the locked box",
   "domain_template": "manipulation_base",
@@ -116,10 +123,9 @@ Example — scene with a locked box (domain enrichment + visual grounding):
     "modified_preconditions": {"pick": ["(not (locked ?i))"]}
   },
   "steps": [
-    {"primitive": "look_at", "args": {"target": "locked_box", "bbox": [180, 120, 310, 280]}},
-    {"primitive": "pick",    "args": {"object": "screwdriver", "bbox": [330, 200, 400, 290]}},
-    {"primitive": "place",   "args": {"object": "screwdriver", "location": "table_a",
-                                      "location_bbox": [80, 280, 220, 350]}}
+    {"primitive": "look_at", "args": {"target": "locked_box"}},
+    {"primitive": "pick",    "args": {"object": "screwdriver"}},
+    {"primitive": "place",   "args": {"object": "screwdriver", "location": "table_a"}}
   ]
 }
 

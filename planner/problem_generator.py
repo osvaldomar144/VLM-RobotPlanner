@@ -16,10 +16,14 @@ from pathlib import Path
 from vlm.planner import VLMPlan, PlanStep
 
 
-# Primitives that consume an object from a source
 _PICK_PRIMITIVES = {"pick", "unstack", "pick-from-container"}
-# Primitives that deposit an object at a destination
 _PLACE_PRIMITIVES = {"place", "stack", "place-in-container"}
+# When hold primitives appear with no corresponding pick, infer_init_state treats the
+# operated object as already held (arm continues from a prior iteration). Goal inference
+# relies on VLM enrichment (new_actions effects) rather than hardcoded logic.
+_HOLD_PRIMITIVES = {"pour", "tilt"}
+# Standard primitives handled by dedicated goal inference (no enrichment needed)
+_STANDARD_PRIMITIVES = _PICK_PRIMITIVES | _PLACE_PRIMITIVES | {"look_at"}
 
 # Maps VLMPlan.domain_template → PDDL domain name (must match (define (domain ...)) in file)
 DOMAIN_TEMPLATE_TO_NAME: dict[str, str] = {
@@ -47,7 +51,12 @@ def extract_objects_and_locations(steps: list[PlanStep]) -> tuple[set[str], set[
         if "location" in args:
             locations.add(args["location"])
         if step.primitive == "look_at" and "target" in args:
-            objects.add(args["target"])   # look_at target is an item
+            objects.add(args["target"])
+        # Enrichment primitives: all arg values are items (not locations)
+        if step.primitive not in _STANDARD_PRIMITIVES:
+            for v in args.values():
+                if isinstance(v, str) and v:
+                    objects.add(v)
 
     return objects, locations
 
@@ -71,7 +80,6 @@ def infer_init_state(steps: list[PlanStep]) -> tuple[list[tuple], set[str]]:
     held_objects: set[str]             = set()
     seen:         set[str]             = set()
 
-    # Objects that are explicitly picked in this plan
     picked = {
         step.args.get("object", "")
         for step in steps
@@ -85,7 +93,17 @@ def infer_init_state(steps: list[PlanStep]) -> tuple[list[tuple], set[str]]:
             if obj and obj not in picked:
                 held_objects.add(obj)
 
-    # Objects that are picked → they start on a surface
+    # Same for hold primitives (pour source, tilt object) — operated on a held item.
+    # The VLM may use arbitrary PDDL parameter names (e.g. "can" instead of "source")
+    # so fall back to positional extraction: first arg value = the held object.
+    for step in steps:
+        if step.primitive in _HOLD_PRIMITIVES:
+            vals = list(step.args.values())
+            obj = (step.args.get("source") or step.args.get("object") or
+                   (vals[0] if vals else ""))
+            if obj and obj not in picked:
+                held_objects.add(obj)
+
     for step in steps:
         if step.primitive in _PICK_PRIMITIVES:
             obj = step.args.get("object", "")
@@ -97,7 +115,80 @@ def infer_init_state(steps: list[PlanStep]) -> tuple[list[tuple], set[str]]:
     return on_pairs, held_objects
 
 
-def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, ...]]:
+def _goal_from_enrichment_action(
+    action_def: dict, step_args: dict
+) -> str | None:
+    """
+    Given a VLM-generated action definition and the concrete step arguments,
+    derive the PDDL goal fact by finding the first positive (non-negated) predicate
+    in the action's effect and substituting the actual argument values.
+
+    Works with any predicate name the VLM chose — no hardcoded names.
+    Returns a PDDL fact string like '(poured bottle glass)', or None if derivation fails.
+    """
+    import re
+
+    effect_str = action_def.get("effect", "")
+    params_str = action_def.get("parameters", "")
+
+    # Parse parameters: "(?source - item ?target - item)" → [source, target]
+    param_names = re.findall(r"\?([a-zA-Z][\w-]*)", params_str)
+    arg_values  = list(step_args.values())
+    binding = {pn: str(arg_values[i]) for i, pn in enumerate(param_names) if i < len(arg_values)}
+
+    _PDDL_KW = {"and", "or", "not", "when", "forall", "exists"}
+
+    def _top_level_exprs(text: str) -> list[str]:
+        """Extract direct children expressions (respects nested parens)."""
+        exprs, depth, start = [], 0, -1
+        for i, c in enumerate(text):
+            if c == "(":
+                if depth == 0: start = i
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    exprs.append(text[start: i + 1])
+                    start = -1
+        return exprs
+
+    def _find_positive_pred(expr: str) -> str | None:
+        """Recursively search for the first positive predicate fact."""
+        expr = expr.strip()
+        if not expr.startswith("("):
+            return None
+        inner = expr[1:-1].strip()
+        head  = inner.split()[0] if inner else ""
+
+        if head in ("not",):        # negated — skip entirely
+            return None
+        if head in ("and", "or"):   # recurse into children
+            for child in _top_level_exprs(inner[len(head):].strip()):
+                result = _find_positive_pred(child)
+                if result:
+                    return result
+            return None
+        if head in _PDDL_KW:        # other keyword — skip
+            return None
+
+        # Leaf predicate — substitute ?vars
+        tokens = inner.split()
+        pred_name = tokens[0]
+        pred_args = []
+        for tok in tokens[1:]:
+            if tok.startswith("?"):
+                pred_args.append(binding.get(tok[1:], tok))
+            elif tok not in ("-", "item", "location", "object"):
+                pred_args.append(tok)
+        return f"({pred_name} {' '.join(pred_args)})" if pred_args else f"({pred_name})"
+
+    return _find_positive_pred(effect_str)
+
+
+def infer_goal_state(
+    steps: list[PlanStep],
+    domain_additions: dict | None = None,
+) -> list[tuple[str, ...]]:
     """
     Infer the goal state.
 
@@ -109,6 +200,13 @@ def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, ...]]:
     otherwise Fast Downward would return an empty plan because the default
     goal (gripper-empty) is already satisfied in the initial state.
     """
+    enrichment_actions: dict[str, dict] = {}
+    if domain_additions:
+        for act in domain_additions.get("new_actions", []):
+            name = act.get("name", "")
+            if name:
+                enrichment_actions[name] = act
+
     goal: list[tuple[str, ...]] = []
 
     for step in steps:
@@ -117,6 +215,16 @@ def infer_goal_state(steps: list[PlanStep]) -> list[tuple[str, ...]]:
             loc = step.args.get("location", "")
             if obj and loc:
                 goal.append(("on", obj, loc))
+
+    # Enrichment primitives: derive goal from the VLM-generated action definition.
+    # The VLM is free to choose any predicate name — we extract it from its effect.
+    for step in steps:
+        if step.primitive not in _STANDARD_PRIMITIVES:
+            act_def = enrichment_actions.get(step.primitive)
+            if act_def:
+                fact = _goal_from_enrichment_action(act_def, step.args)
+                if fact:
+                    goal.append(("_raw_fact", fact))  # raw PDDL fact, rendered as-is
 
     # Pick-only plan: goal = holding the picked object(s)
     if not goal:
@@ -164,7 +272,7 @@ def generate_problem(
 
     objects, locations = extract_objects_and_locations(plan.steps)
     init_pairs, held_objects = infer_init_state(plan.steps)
-    goal_facts = infer_goal_state(plan.steps)
+    goal_facts = infer_goal_state(plan.steps, domain_additions=plan.domain_additions)
 
     all_locations = locations | {loc for _, loc in init_pairs}
     # Held objects are items but have no (on ...) fact and no source location
@@ -175,7 +283,6 @@ def generate_problem(
     lines.append(f"  (:domain {domain_name})")
     lines.append("")
 
-    # Objects
     obj_str = " ".join(sorted(all_objects)) + " - item"      if all_objects  else ""
     loc_str = " ".join(sorted(all_locations)) + " - location" if all_locations else ""
     lines.append("  (:objects")
@@ -196,6 +303,11 @@ def generate_problem(
         lines.append(f"    (clear {obj})")
     for loc in sorted(all_locations):
         lines.append(f"    (reachable {loc})")
+    # Items are also reachable on the table. Required when VLM-enriched actions
+    # (e.g. pour, tilt) use (reachable ?target) where ?target is an item.
+    # The domain now declares (reachable ?o - object) so this type-checks.
+    for obj in sorted(all_objects):
+        lines.append(f"    (reachable {obj})")
     if not held_objects:
         lines.append("    (gripper-empty)")    # omit if arm is holding something
 
@@ -221,10 +333,11 @@ def generate_problem(
 
     # Goal
     lines.append("  (:goal")
-    on_goals     = [f for f in goal_facts if f[0] == "on"]
+    on_goals      = [f for f in goal_facts if f[0] == "on"]
     holding_goals = [f for f in goal_facts if f[0] == "holding"]
-
     camera_goals  = [f for f in goal_facts if f[0] == "camera-aimed-at"]
+    raw_goals     = [f for f in goal_facts if f[0] == "_raw_fact"]
+
     all_goal_facts = []
     for f in on_goals:
         all_goal_facts.append(f"(on {f[1]} {f[2]})")
@@ -232,6 +345,8 @@ def generate_problem(
         all_goal_facts.append(f"(holding {f[1]})")
     for f in camera_goals:
         all_goal_facts.append(f"(camera-aimed-at {f[1]})")
+    for f in raw_goals:
+        all_goal_facts.append(f[1])  # already a full PDDL fact string
 
     if not all_goal_facts:
         all_goal_facts = ["(gripper-empty)  ; no explicit goal inferred"]

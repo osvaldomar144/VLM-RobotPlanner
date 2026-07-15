@@ -10,7 +10,7 @@ outside the robot (e.g. in a web demo or offline batch evaluation).
 The ROS2 Orchestrator node is a thin wrapper that calls Pipeline.run()
 and dispatches the resulting PrimitiveCall list to MoveIt / Nav2.
 
-Repair loop (Fase D):
+Repair loop (Phase D):
   If FastDownward returns no plan, the pipeline classifies the failure
   (syntax error vs. unsolvable) and retries up to `repair_retries` times.
   Full LLM-based repair is marked TODO — for Phase 1 the loop just retries
@@ -50,8 +50,8 @@ DOMAIN_TEMPLATE_FILES: dict[str, str] = {
 @dataclass
 class PipelineResult:
     """
-    Full output of Pipeline.run(). Carries every intermediate artifact so
-    the Orchestrator and test suites can inspect what happened at each stage.
+    Full output of Pipeline.run(). Intermediate artifacts are included for
+    debugging and offline analysis; failure_stage locates where the run stopped.
 
     failure_stage values: "vlm" | "enrichment" | "planning" | "repair_exhausted"
     """

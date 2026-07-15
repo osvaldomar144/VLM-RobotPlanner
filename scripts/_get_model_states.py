@@ -33,6 +33,7 @@ from rclpy.node import Node
 _SKIP = frozenset({
     "ground_plane", "sun", "panda", "overview_camera",
     "table", "world", "sky", "default",
+    
 })
 
 _TIMEOUT_SEC = 5.0

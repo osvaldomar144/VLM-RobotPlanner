@@ -1,12 +1,10 @@
-; Domain template 3 — Tabletop manipulation with containers
+; Domain template 3: Tabletop manipulation with containers
 ; Use when: scene contains drawers, boxes, or other openable containers.
-; Extends: manipulation_stacking — adds container type, open/closed state,
-;          pick-from-container, place-in-container.
-; Phase: 1 (advanced)
+; Extends: manipulation_stacking (adds container type, open/closed state)
 ; New primitives: open_container, close_container
-; PDDL actions: open-container, close-container → ContainerPrimitive
-;               pick-from-container → PickPrimitive
-;               place-in-container  → PlacePrimitive
+; PDDL actions: open/close-container (ContainerPrimitive)
+;               pick-from-container (PickPrimitive)
+;               place-in-container (PlacePrimitive)
 
 (define (domain manipulation-containers)
   (:requirements :strips :typing)
@@ -26,7 +24,7 @@
     (closed ?c - container)              ; container is closed
     (holding ?i - item)
     (gripper-empty)
-    (reachable ?l - location)
+    (reachable ?o - object)
     (camera-aimed-at ?i - item)
   )
 

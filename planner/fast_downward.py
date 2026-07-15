@@ -46,7 +46,9 @@ class FastDownwardPlanner:
             )
 
             if result.returncode not in (0, 1):
-                raise RuntimeError(f"Fast Downward error:\n{result.stderr}")
+                # FD often prints parse/type errors to stdout, not stderr
+                detail = result.stderr or result.stdout[:2000]
+                raise RuntimeError(f"Fast Downward error (rc={result.returncode}):\n{detail}")
 
             plan_path = Path(plan_file)
             if not plan_path.exists():

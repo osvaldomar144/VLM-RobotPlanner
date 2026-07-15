@@ -2,20 +2,19 @@
 vlm/perception.py — Perception Module: visual grounding for object name resolution.
 
 Phase 1 (simulation):
-  Maps VLM-generated object names to known PDDL names using OWL-ViT open-vocabulary
+  Maps VLM-generated object names to known PDDL names using GroundingDINO open-vocabulary
   object detection.  Runs on the host GPU alongside the VLM.  The GazeboOracle still
   provides 3D poses — this module only corrects the names before PDDL planning.
 
 Phase 2 (real robot — future):
   Extend get_pose() to use RealSense D435i depth instead of the oracle.  The
-  grounding logic (OWL-ViT inference) is identical; only the 3D localization backend
-  changes.  No other code needs to be modified.
+  grounding logic (GroundingDINO inference) is identical; only the 3D localization
+  backend changes.  No other code needs to be modified.
 
-Why this matters:
-  The VLM generates object names from the task text ("blue cube", "cylinder", …)
-  which may differ from the PDDL names ("blue_box", "red_cup").  Without grounding,
-  the oracle lookup fails.  With grounding, names are corrected visually before
-  reaching the PDDL pipeline — regardless of how the VLM describes the object.
+The VLM generates object names from the task text ("blue cube", "cylinder", …)
+which may differ from the PDDL names ("blue_box", "red_cup").  Without grounding,
+the oracle lookup fails.  With grounding, names are corrected visually before
+reaching the PDDL pipeline — regardless of how the VLM describes the object.
 """
 
 from __future__ import annotations
@@ -152,6 +151,7 @@ class PerceptionModule:
         self._processor = None
         self._model     = None
         self._device    = "cuda" if torch.cuda.is_available() else "cpu"
+        self._last_detection: dict | None = None   # set after each get_pose()
         # Allow per-instance threshold override.
         # Typical values: 0.15 (simulation), 0.20-0.25 (real robot).
         if threshold is not None:
@@ -170,125 +170,6 @@ class PerceptionModule:
         print("[OK]   PerceptionModule loaded.")
 
     # ── Public API ────────────────────────────────────────────────────────────
-
-    def ground_names_with_bbox(
-        self,
-        plan:           VLMPlan,
-        model_poses:    dict[str, dict],   # {"red_cup": {"x":…,"y":…,"z":…}, …}
-        img_w:          int = _IMG_W,
-        img_h:          int = _IMG_H,
-    ) -> VLMPlan:
-        """
-        Correct object/location names in *plan* using VLM-provided bounding
-        boxes and camera projection.  No OWL-ViT required.
-
-        For each step arg that carries a bbox:
-          1. Take the bbox center (u, v) from the VLM output.
-          2. Project every Gazebo model's 3D position -> pixel (u_m, v_m).
-          3. Find the model whose projected pixel is nearest to the bbox center.
-          4. Replace the step name with that Gazebo model name.
-
-        Sim-to-real note: on the real robot, step 2 becomes
-            depth = realsense.get_depth(u, v) -> 3D point in robot frame
-        and no oracle lookup is needed at all.
-
-        Falls back gracefully if no bbox is present in the plan.
-        Returns a new VLMPlan; the original is not modified.
-        """
-        if not model_poses:
-            return plan
-
-        # Pre-project all Gazebo models to pixel coordinates
-        model_pixels: dict[str, tuple[float, float]] = {}
-        for name, pos in model_poses.items():
-            px = world_to_pixel(np.array([pos["x"], pos["y"], pos["z"]]))
-            if px is not None:
-                model_pixels[name] = px
-
-        if not model_pixels:
-            return plan
-
-        used_pddl: set[str] = set()
-
-        def _nearest(u: float, v: float) -> str | None:
-            best_name: str | None = None
-            best_dist = float("inf")
-            for mname, (mu, mv) in model_pixels.items():
-                if mname in used_pddl:
-                    continue
-                d = math.hypot(u - mu, v - mv)
-                if d < best_dist:
-                    best_dist = d
-                    best_name = mname
-            return best_name
-
-        def _center(bbox) -> tuple[float, float] | None:
-            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                return None
-            x1, y1, x2, y2 = bbox
-            if max(x1, y1, x2, y2) <= 1.0:   # normalised -> pixels
-                x1, y1, x2, y2 = x1*img_w, y1*img_h, x2*img_w, y2*img_h
-            return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-        corrected = deepcopy(plan)
-        changed   = False
-
-        for step in corrected.steps:
-            args = dict(step.args)
-
-            # pick / look_at — "bbox" -> correct "object" or "target"
-            c = _center(args.get("bbox"))
-            if c:
-                for key in ("object", "target"):
-                    if key in args:
-                        match = _nearest(*c)
-                        if match:
-                            print(f"[OK]   bbox->'{match}' "
-                                  f"(was '{args[key]}', "
-                                  f"center=({c[0]:.0f},{c[1]:.0f}))")
-                            args[key] = match
-                            used_pddl.add(match)
-                            changed = True
-                        break
-
-            # place — "location_bbox" -> correct "location"
-            lc = _center(args.get("location_bbox"))
-            if lc and "location" in args:
-                match = _nearest(*lc)
-                if match:
-                    print(f"[OK]   location_bbox->'{match}' "
-                          f"(was '{args['location']}', "
-                          f"center=({lc[0]:.0f},{lc[1]:.0f}))")
-                    args["location"] = match
-                    used_pddl.add(match)
-                    changed = True
-
-            step.args = args
-
-        # Second pass: propagate name_map to ANY remaining step arg that still
-        # holds an old VLM name (e.g. "object" in place step shares the name
-        # already corrected in the pick step but has no bbox of its own).
-        name_map = {
-            old: new
-            for step, orig in zip(corrected.steps, plan.steps)
-            for key in orig.args
-            if isinstance(orig.args.get(key), str)
-            and isinstance(step.args.get(key), str)
-            and orig.args[key] != step.args[key]
-            for old, new in [(orig.args[key], step.args[key])]
-        }
-        if name_map:
-            for step in corrected.steps:
-                step.args = {
-                    k: (name_map.get(v, v) if isinstance(v, str) else v)
-                    for k, v in step.args.items()
-                }
-
-        if not changed:
-            print("[INFO] PerceptionModule: no bbox in plan "
-                  "— falling back to OWL-ViT name grounding.")
-
-        return corrected
 
     # Words that hint at a model being a location (surface/stand/shelf)
     # rather than a graspable item.
@@ -414,7 +295,6 @@ class PerceptionModule:
             icon = "[OK]  " if "visual" in tag else "[WARN]"
             print(f"{icon} '{name}' -> '{match}' ({tag})")
 
-        # Apply corrections
         corrected = deepcopy(plan)
         corrected.steps = [
             PlanStep(
@@ -438,6 +318,39 @@ class PerceptionModule:
 
     GET_POSE_THRESHOLD = 0.10
 
+    @staticmethod
+    def _median_depth_from_box(
+        depth_image: np.ndarray,
+        box: list[float],
+        shrink: float = 0.35,
+        min_valid: int = 5,
+    ) -> float | None:
+        """
+        Estimate depth of an object from its bounding box using RealSense depth data.
+
+        Samples the central (1-2*shrink) region of the box to avoid edge noise and
+        background pixels. Returns the median of valid (non-zero) depth values in
+        metres, or None if fewer than min_valid valid readings are found.
+
+        depth_image: uint16 H×W array, values in mm (RealSense D435i convention).
+        box:         [x0, y0, x1, y1] in pixels.
+        shrink:      fraction to crop from each side of the box before sampling.
+        """
+        x0, y0, x1, y1 = box
+        dx = (x1 - x0) * shrink
+        dy = (y1 - y0) * shrink
+        rx0 = int(max(0, x0 + dx))
+        ry0 = int(max(0, y0 + dy))
+        rx1 = int(min(depth_image.shape[1] - 1, x1 - dx))
+        ry1 = int(min(depth_image.shape[0] - 1, y1 - dy))
+        if rx1 <= rx0 or ry1 <= ry0:
+            return None
+        patch = depth_image[ry0:ry1, rx0:rx1].astype(np.float32)
+        valid = patch[patch > 0]
+        if valid.size < min_valid:
+            return None
+        return float(np.median(valid)) / 1000.0  # mm → metres
+
     def get_pose(
         self,
         object_name: str,
@@ -446,110 +359,155 @@ class PerceptionModule:
         cam_to_base: np.ndarray,
         obj_z_base: float = 0.025,
         vlm_description: str | None = None,
-        pre_bbox: list | None = None,
+        depth_image: np.ndarray | None = None,
     ) -> dict | None:
         """
-        Estimate a 3D object pose in panda_link0 frame via ray-plane intersection.
+        Estimate a 3D object pose in panda_link0 frame.
 
-        The query for GroundingDINO is built as:
+        Two modes depending on whether a depth image is supplied:
+
+        - depth_image provided (real robot, RealSense D435i): samples the central
+          region of the detected bounding box in the depth channel, takes the median
+          of valid readings, and unprojects using K.  No fixed-z assumption.
+
+        - depth_image=None (simulation fallback): ray-plane intersection at z=obj_z_base
+          (table surface height in panda_link0 frame).
+
+        The DINO query is built as:
           1. vlm_description if provided (e.g. "the red cup on the table")
           2. Otherwise: object_name converted to natural language ("red cup")
           3. Fallback synonyms from _QUERY_SYNONYMS if defined
 
-        Passing vlm_description from the VLM plan avoids any hardcoded mapping
-        and generalises to arbitrary objects without changes to this code.
-
-        Phase 2 (sim): assumes a known table-plane height (obj_z_base) and uses
-        the pinhole camera model to back-project a detected bbox centre to a 3D
-        point on that plane.
-
-        Phase 4 (real robot): replace this with a depth-pixel lookup using the
-        RealSense D435i — get depth at (u, v), deproject with K, then apply
-        cam_to_base.  The bbox detection logic (OWL-ViT) stays identical.
-
-        Returns {"x": …, "y": …, "z": obj_z_base} in panda_link0 frame,
-        or None if the object is not detected or the ray misses the plane.
-
-        pre_bbox: [x1,y1,x2,y2] from VLM output — skips GroundingDINO detection.
-          Use when the VLM has already localised the object in the image (better
-          than GroundingDINO for visually ambiguous tools like hammer vs wrench).
-          Phase 4: same bbox → depth lookup instead of ray-plane intersection.
+        Returns {"x": …, "y": …, "z": …} in panda_link0 frame, or None.
         """
         if self._model is None:
             raise RuntimeError("Call load() before get_pose()")
 
-        # If the VLM provided a bbox, use it directly — no GroundingDINO needed.
-        # Validation shows GroundingDINO fuses visually similar tools (hammer +
-        # wrench + drill) into one label; the VLM is more reliable for tool ID.
-        if pre_bbox is not None and len(pre_bbox) == 4:
-            x1, y1, x2, y2 = pre_bbox
+        readable = object_name.replace("_", " ")
+        synonyms = self._QUERY_SYNONYMS.get(object_name, [])
+        primary  = vlm_description.lower() if vlm_description else readable
+        queries  = list(dict.fromkeys([primary, readable] + synonyms))
+
+        best_score = -1.0
+        best_box   = None
+        for q in queries:
+            readable_q = q.replace("_", " ").lower() + " ."
+            inputs_q = self._processor(
+                images=image, text=readable_q, return_tensors="pt"
+            ).to(self._device)
+            with torch.no_grad():
+                out_q = self._model(**inputs_q)
             H, W = image.height, image.width
-            x1 = max(0, min(x1, W)); x2 = max(0, min(x2, W))
-            y1 = max(0, min(y1, H)); y2 = max(0, min(y2, H))
-            u = (x1 + x2) / 2.0
-            v = (y1 + y2) / 2.0
-            print(f"[Perception] get_pose '{object_name}': using VLM bbox "
-                  f"[{x1},{y1},{x2},{y2}] → center=({u:.0f},{v:.0f})")
-        else:
-            # GroundingDINO detection path (fallback / place location)
-            readable = object_name.replace("_", " ")
-            synonyms = self._QUERY_SYNONYMS.get(object_name, [])
-            primary  = vlm_description.lower() if vlm_description else readable
-            queries  = list(dict.fromkeys([primary, readable] + synonyms))
+            res = self._processor.post_process_grounded_object_detection(
+                out_q,
+                inputs_q.input_ids,
+                threshold=self.GET_POSE_THRESHOLD,
+                text_threshold=self.GET_POSE_THRESHOLD * 0.8,
+                target_sizes=[(H, W)],
+            )[0]
+            for box, score in zip(res["boxes"], res["scores"]):
+                s = float(score)
+                if s > best_score:
+                    best_score = s
+                    best_box   = box.tolist()
 
-            best_score = -1.0
-            best_box   = None
-            for q in queries:
-                readable_q = q.replace("_", " ").lower() + " ."
-                inputs_q = self._processor(
-                    images=image, text=readable_q, return_tensors="pt"
-                ).to(self._device)
-                with torch.no_grad():
-                    out_q = self._model(**inputs_q)
-                H, W = image.height, image.width
-                res = self._processor.post_process_grounded_object_detection(
-                    out_q,
-                    inputs_q.input_ids,
-                    threshold=self.GET_POSE_THRESHOLD,
-                    text_threshold=self.GET_POSE_THRESHOLD * 0.8,
-                    target_sizes=[(H, W)],
-                )[0]
-                for box, score in zip(res["boxes"], res["scores"]):
-                    s = float(score)
-                    if s > best_score:
-                        best_score = s
-                        best_box   = box.tolist()
+        if best_box is None:
+            self._last_detection = None
+            return None
 
-            if best_box is None:
-                return None
+        u = (best_box[0] + best_box[2]) / 2.0
+        v = (best_box[1] + best_box[3]) / 2.0
+        print(f"[Perception] get_pose '{object_name}': GroundingDINO "
+              f"score={best_score:.3f} → center=({u:.0f},{v:.0f})")
+        self._last_detection = {
+            "name":  object_name,
+            "box":   best_box,
+            "score": best_score,
+        }
 
-            u = (best_box[0] + best_box[2]) / 2.0
-            v = (best_box[1] + best_box[3]) / 2.0
-            print(f"[Perception] get_pose '{object_name}': GroundingDINO "
-                  f"score={best_score:.3f} → center=({u:.0f},{v:.0f})")
+        R     = cam_to_base[:3, :3]
+        t     = cam_to_base[:3, 3]
+        K_inv = np.linalg.inv(K)
 
-        # Unproject to normalised camera-frame ray
-        K_inv  = np.linalg.inv(K)
+        # ── Mode 1: depth-based unprojection (real robot, RealSense) ─────────
+        if depth_image is not None:
+            z_cam = self._median_depth_from_box(depth_image, best_box)
+            if z_cam is not None and z_cam > 0.05:
+                p_cam = K_inv @ np.array([u, v, 1.0]) * z_cam
+                point = R @ p_cam + t
+                print(f"[Perception] depth median z_cam={z_cam:.3f}m "
+                      f"→ base ({point[0]:.3f},{point[1]:.3f},{point[2]:.3f})")
+                return {"x": float(point[0]), "y": float(point[1]), "z": float(point[2])}
+            print(f"[Perception] depth sampling failed for '{object_name}' "
+                  f"— falling back to ray-plane")
+
+        # ── Mode 2: ray-plane intersection at fixed z (simulation fallback) ──
         d_cam  = K_inv @ np.array([u, v, 1.0])
-
-        # Transform ray to panda_link0
-        R      = cam_to_base[:3, :3]
-        t      = cam_to_base[:3, 3]
         d_base = R @ d_cam
         norm   = np.linalg.norm(d_base)
         if norm < 1e-9:
             return None
         d_base /= norm
-
-        # Ray–plane intersection at z = obj_z_base
         if abs(d_base[2]) < 1e-9:
             return None
         t_ray = (obj_z_base - t[2]) / d_base[2]
         if t_ray < 0:
             return None
-
         point = t + t_ray * d_base
         return {"x": float(point[0]), "y": float(point[1]), "z": float(obj_z_base)}
+
+    @staticmethod
+    def draw_detections(
+        image: "Image.Image",
+        detections: list[dict],
+    ) -> "Image.Image":
+        """
+        Draw DINO detection boxes on a copy of image.
+
+        detections: list of {"name": str, "box": [x1,y1,x2,y2], "score": float}
+        Returns annotated PIL Image.
+        """
+        from PIL import ImageDraw, ImageFont
+        import random
+
+        img = image.copy().convert("RGB")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except Exception:
+            font = ImageFont.load_default()
+            font_small = font
+
+        palette = ["#FF4444", "#44FF44", "#4444FF", "#FF9900", "#FF44FF",
+                   "#00CCFF", "#FFFF00", "#FF6699", "#99FF66", "#6699FF"]
+        color_map: dict[str, str] = {}
+        for i, det in enumerate(detections):
+            name = det["name"]
+            if name not in color_map:
+                color_map[name] = palette[len(color_map) % len(palette)]
+
+        for det in detections:
+            name  = det["name"]
+            box   = det["box"]          # [x1, y1, x2, y2]
+            score = det["score"]
+            color = color_map[name]
+            x1, y1, x2, y2 = [int(v) for v in box]
+
+            for d in range(3):
+                draw.rectangle([x1-d, y1-d, x2+d, y2+d], outline=color)
+
+            label = f"{name}  {score:.2f}"
+            bbox_txt = draw.textbbox((x1, y1 - 24), label, font=font)
+            draw.rectangle(bbox_txt, fill=color)
+            draw.text((x1, y1 - 24), label, fill="black", font=font)
+
+            # Centre crosshair
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            draw.line([cx - 8, cy, cx + 8, cy], fill=color, width=2)
+            draw.line([cx, cy - 8, cx, cy + 8], fill=color, width=2)
+
+        return img
 
     @staticmethod
     def load_camera_data(
@@ -676,7 +634,6 @@ class PerceptionModule:
     @staticmethod
     def _token_fallback(name: str, candidates: list[str]) -> str:
         """Fallback: pick candidate with most token overlap (+ synonym expansion)."""
-        # Expand name tokens with synonyms
         raw_tokens = set(name.lower().replace("_", " ").split())
         expanded: set[str] = set(raw_tokens)
         for token in raw_tokens:

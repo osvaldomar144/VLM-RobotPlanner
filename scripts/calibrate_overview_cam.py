@@ -51,7 +51,7 @@ def _read_pose_from_world(world_name: str):
     return None
 
 
-def _compute_cam_matrix(pose, K_override=None, W=640, H=480, fov=1.047):
+def _compute_cam_matrix(pose, K_override=None, W=1280, H=960, fov=1.047):
     """Given SDF pose [x,y,z,r,p,y], return (K, cam_to_base, R_world_to_cam, t_world_to_cam).
     K_override: use actual K from camera_info topic instead of computing from FOV."""
     px, py, pz, roll, pitch, yaw = pose
@@ -125,11 +125,14 @@ def _read_object_positions_from_world(world_name: str) -> dict:
     # Objects to SHOW: only desk/workspace objects, not furniture/decor
     _SHOW = {
         # office
-        "pen","eraser","keyboard","mouse","coffee_cup","notebook",
+        "pen","pen2","eraser","keyboard","mouse","coffee_cup","notebook",
         "paperweight","monitor_1","laptop",
         # workshop
         "hammer","monkey_wrench","cordless_drill","coke_can",
         "gauge_ball","target_tray","hex_bolt",
+        # kitchen
+        "bottle","glass","glass2","cup","can","plate","mug","spoon","knife",
+        "cutting_board","target_tray",
     }
     _SKIP = {"room","floor","robot_pedestal","table","workbench","side_table",
              "overview_camera","trash_can","plant","office_chair","bookshelf",
@@ -176,6 +179,12 @@ def _annotate_workspace(image, K, R, t, world_name, cam_pose=None):
     # ── Workspace areas per scene (world frame) ────────────────────────────
     # Each scene has one or more rectangular surfaces: [(corners_list, color, label)]
     WORKSPACE_AREAS = {
+        "kitchen": [
+            (  # Counter: model center (0.85,0), 200x80cm — x:[0.45,1.25] y:[-1.00,+1.00]
+                [[0.45,-1.00,0.770],[0.45,1.00,0.770],[1.25,1.00,0.770],[1.25,-1.00,0.770]],
+                (0,220,220), "counter"
+            ),
+        ],
         "office": [
             (  # Main desk: center (0.85,0), 100×60cm
                 [[0.35,-0.30,0.770],[0.35,0.30,0.770],[1.35,0.30,0.770],[1.35,-0.30,0.770]],
@@ -197,24 +206,23 @@ def _annotate_workspace(image, K, R, t, world_name, cam_pose=None):
     # Robot base (static, same for all scenes)
     robot_base_world = [0.20, 0.00, 0.77]
 
-    # Read object positions from world file
     objects_world = _read_object_positions_from_world(world_name)
     print(f"  Objects from world file: {list(objects_world.keys())}")
 
-    areas = WORKSPACE_AREAS.get(world_name, WORKSPACE_AREAS["office"])
-
-    # Draw all workspace surface perimeters
+    # Draw workspace perimeter. PIL clips lines at image boundaries automatically;
+    # only reject points behind the camera (depth <= 0).
+    areas = WORKSPACE_AREAS.get(world_name, [])
     for corners_list, color, label in areas:
-        corners_px = []
-        for corner in corners_list:
-            px = _project_point(corner, K, R, t)
-            if px and -50 <= px[0] < W+50 and -50 <= px[1] < H+50:
-                corners_px.append(px)
+        corners_px = [_project_point(c, K, R, t) for c in corners_list]
+        corners_px = [p for p in corners_px if p is not None]
         if len(corners_px) >= 3:
             for i in range(len(corners_px)):
                 draw.line([corners_px[i], corners_px[(i+1) % len(corners_px)]],
-                          fill=color, width=2)
-            draw.text((corners_px[0][0]+2, corners_px[0][1]+2), label, fill=color)
+                          fill=color, width=3)
+            # Place label at the first corner that falls within the image frame.
+            in_frame = [p for p in corners_px if 0 <= p[0] < W and 0 <= p[1] < H]
+            lbl_pt = in_frame[0] if in_frame else corners_px[0]
+            draw.text((lbl_pt[0]+4, lbl_pt[1]+4), label, fill=color)
 
     # Draw robot base (red dot)
     rb_px = _project_point(robot_base_world, K, R, t)
@@ -292,21 +300,8 @@ def main():
     print(f"    position : x={pose[0]:.3f}  y={pose[1]:.3f}  z={pose[2]:.3f}")
     print(f"    rotation : roll={pose[3]:.3f}  pitch={pose[4]:.3f}  yaw={pose[5]:.3f}")
 
-    # Load actual K from camera_info if available (more accurate than FOV formula)
-    K_real = None
-    ov_info = _REPO_ROOT / "data" / "overview_camera_info.json"
-    if ov_info.exists():
-        import json
-        with open(str(ov_info)) as f:
-            K_real = np.array(json.load(f)["K"])
-        print(f"  Intrinsics (from camera_info): fx={K_real[0,0]:.1f}  cx={K_real[0,2]:.1f}")
-    else:
-        print(f"  Intrinsics (computed from FOV): run calibration with sim active to get real K")
-
-    K, cam_to_base, R, t = _compute_cam_matrix(pose, K_override=K_real)
-    print(f"  Using fx={K[0,0]:.1f}  cx={K[0,2]:.1f}  cy={K[1,2]:.1f}")
-
-    # ── 2. Get image ──────────────────────────────────────────────────────────
+    # ── 2. Capture image (before loading K, so overview_camera_info.json is
+    #        updated with the current camera resolution first) ─────────────────
     if args.image:
         img_path = Path(args.image)
         if not img_path.exists():
@@ -321,17 +316,23 @@ def main():
             sys.exit("[ERROR] No overview image available. Run with sim active.")
         img = Image.open(str(img_path)).convert("RGB")
 
-    # ── 3. Upscale for better annotation quality ─────────────────────────────
-    SCALE = 2
-    W0, H0 = img.width, img.height
-    img = img.resize((W0 * SCALE, H0 * SCALE), Image.LANCZOS)
-    # Scale intrinsics accordingly
-    K_scaled = K.copy()
-    K_scaled[0] *= SCALE   # fx, cx
-    K_scaled[1] *= SCALE   # fy, cy
+    # ── 3. Load K after capture (overview_camera_info.json is now up to date) ─
+    import json
+    K_real = None
+    ov_info = _REPO_ROOT / "data" / "overview_camera_info.json"
+    if ov_info.exists():
+        with open(str(ov_info)) as f:
+            K_real = np.array(json.load(f)["K"])
+        print(f"  Intrinsics (from camera_info): fx={K_real[0,0]:.1f}  cx={K_real[0,2]:.1f}  ({img.width}x{img.height})")
+    else:
+        print(f"  Intrinsics (computed from FOV {img.width}x{img.height})")
+
+    K, cam_to_base, R, t = _compute_cam_matrix(
+        pose, K_override=K_real, W=img.width, H=img.height)
+    print(f"  Using fx={K[0,0]:.1f}  cx={K[0,2]:.1f}  cy={K[1,2]:.1f}")
 
     # ── 4. Annotate workspace ─────────────────────────────────────────────────
-    img = _annotate_workspace(img, K_scaled, R, t, args.world, cam_pose=pose)
+    img = _annotate_workspace(img, K, R, t, args.world, cam_pose=pose)
 
     # ── 5. Save ───────────────────────────────────────────────────────────────
     out_path = Path(args.out) if args.out else \

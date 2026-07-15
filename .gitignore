@@ -225,14 +225,14 @@ models/
 # Logs
 logs/
 
-#custom
+# Project-specific
 /appunti
 CLAUDE.md
-data/*.png
-data/*.jpg
-data/*.jpeg
-data/gazebo/
-data/scan_pose_test/
+
+# Runtime data — generated at runtime, not part of the codebase.
+# Keep data/.gitkeep so the directory exists after a fresh clone.
+data/*
+!data/.gitkeep
 
 # Docker binary GL libraries (runtime-specific, not project code)
 docker/*.so

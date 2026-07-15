@@ -28,14 +28,11 @@ class NavigateToPrimitive:
 
     def execute(self, destination: str, pose_data: dict | None = None) -> bool:
         """
-        Phase 1: no-op with a clear log message.
+        Phase 1 stub: logs the destination and returns True immediately.
 
         Args:
             destination: Symbolic location name (e.g. "shelf_area").
             pose_data:   3D pose for navigation goal (Phase 3).
-
-        Returns:
-            True (stub always succeeds in Phase 1).
         """
         self._node.get_logger().warn(
             f"[NavigateToPrimitive] navigate_to('{destination}'): "

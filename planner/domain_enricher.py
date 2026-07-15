@@ -41,13 +41,8 @@ class DomainAdditions:
     """
     Scene-specific enrichment suggestions, typically produced by the VLM.
 
-    Fields:
-        new_types:              PDDL type declarations, e.g. ["container - location"]
-        new_predicates:         PDDL predicate declarations, e.g. ["(locked ?i - item)"]
-        new_actions:            Action dicts with keys: name, parameters, precondition, effect
-        modified_preconditions: Map of action_name → list of extra PDDL conditions.
-                                Conditions must use variable names already in that action's
-                                parameter list (the enricher does not re-check this).
+    modified_preconditions conditions must use variable names already declared
+    in the target action's parameter list — the enricher does not re-check this.
     """
     new_types:               list[str]        = field(default_factory=list)
     new_predicates:          list[str]        = field(default_factory=list)
@@ -58,14 +53,8 @@ class DomainAdditions:
 @dataclass
 class EnrichmentResult:
     """
-    Output of DomainEnricher.enrich().
-
-    Fields:
-        domain_text:         The enriched PDDL domain string (ready for Fast Downward).
-        is_valid:            True if structural validation passed.
-        errors:              List of validation error messages.
-        additions_applied:   Human-readable list of what was added.
-        additions_skipped:   Human-readable list of what was rejected and why.
+    Output of DomainEnricher.enrich(). is_valid is True only when structural
+    validation passes; errors contains the reasons when it does not.
     """
     domain_text:        str
     is_valid:           bool
@@ -136,7 +125,7 @@ class DomainEnricher:
                 else:
                     skipped.append(f"predicate '{pred}' — :predicates block not found")
 
-        # 3. New actions
+        # 3. New actions — with auto-repair before inserting
         for action in additions.new_actions:
             name = action.get("name", "")
             if not name:
@@ -145,6 +134,23 @@ class DomainEnricher:
             if name in existing["actions"]:
                 skipped.append(f"action '{name}' already exists — skipped")
                 continue
+
+            # Auto-repair 1: add undeclared variables to parameters
+            action, repaired_vars = self._repair_unbound_variables(action)
+            if repaired_vars:
+                applied.append(f"auto-repaired unbound vars in '{name}': {repaired_vars}")
+
+            # Auto-repair 2: infer missing predicates from action effects
+            inferred = self._infer_predicates_from_effect(action, existing["predicates"])
+            for pred_decl, pred_name in inferred:
+                if pred_name in existing["predicates"]:
+                    continue  # already present (double-check after regex fix)
+                new_text, ok = self._insert_into_block(text, ":predicates", pred_decl)
+                if ok:
+                    text = new_text
+                    applied.append(f"auto-inferred predicate from effect: {pred_decl}")
+                    existing["predicates"].add(pred_name)
+
             action_pddl = self._format_action(action)
             if not self._balanced(action_pddl):
                 skipped.append(f"action '{name}' has unbalanced parentheses — skipped")
@@ -264,7 +270,6 @@ class DomainEnricher:
         if not pre_m:
             return text, False
 
-        # Find the ( that opens the precondition expression
         paren_start = action_block.find("(", pre_m.end())
         if paren_start == -1:
             return text, False
@@ -304,7 +309,6 @@ class DomainEnricher:
             "actions":    set(),
         }
 
-        # Types: find (:types ...) block, collect identifiers that are not "-"
         m = re.search(r"\(:types\b", text)
         if m:
             end = self._find_matching_paren(text, m.start())
@@ -314,15 +318,13 @@ class DomainEnricher:
                 t for t in tokens if t not in self._PDDL_KEYWORDS
             }
 
-        # Predicates: find (:predicates ...) block, collect names of each (name ...) entry
         m = re.search(r"\(:predicates\b", text)
         if m:
             end = self._find_matching_paren(text, m.start())
             block = text[m.start():end + 1] if end != -1 else ""
-            result["predicates"] = set(re.findall(r"\(([a-zA-Z][\w-]*)\s", block))
+            result["predicates"] = set(re.findall(r"\(([a-zA-Z][\w-]*)[\s)]", block))
             result["predicates"].discard("predicates")
 
-        # Actions: simple regex suffices
         result["actions"] = set(re.findall(r"\(:action\s+([a-zA-Z][\w-]*)", text))
 
         return result
@@ -332,12 +334,153 @@ class DomainEnricher:
         m = re.match(r"\(\s*([a-zA-Z][\w-]*)", pred.strip())
         return m.group(1) if m else pred.strip()
 
+    def _repair_unbound_variables(self, action: dict) -> tuple[dict, list[str]]:
+        """
+        Detect ?variable names used in precondition/effect but not declared in
+        parameters, and add them as '?var - item'.
+
+        This fixes a common VLM error where e.g. stir is defined with
+        parameters=(?container) but precondition uses ?tool without declaring it.
+
+        Returns (repaired_action, list_of_added_var_names).
+        """
+        params_str = str(action.get("parameters", "()"))
+        precond    = str(action.get("precondition", ""))
+        effect     = str(action.get("effect", ""))
+
+        # Don't attempt repair on structurally broken params — the balanced-paren
+        # check later in enrich() will catch and skip the action.
+        if not self._balanced(params_str):
+            return action, []
+
+        declared   = set(re.findall(r"\?([a-zA-Z][\w-]*)", params_str))
+        used       = set(re.findall(r"\?([a-zA-Z][\w-]*)", precond + " " + effect))
+        undeclared = sorted(used - declared)
+
+        if not undeclared:
+            return action, []
+
+        fixed = dict(action)
+        extra = " ".join(f"?{v} - item" for v in undeclared)
+        if params_str.strip() in ("()", ""):
+            fixed["parameters"] = f"({extra})"
+        else:
+            fixed["parameters"] = params_str.rstrip(")") + f" {extra})"
+        return fixed, undeclared
+
+    def _infer_predicates_from_effect(
+        self, action: dict, existing_predicates: set[str]
+    ) -> list[tuple[str, str]]:
+        """
+        Extract novel positive predicates from an action's effect string and
+        return declarations for any that are not already in the domain.
+
+        This handles the case where the VLM adds a new_action with a novel
+        result predicate but forgets to declare it in new_predicates.
+
+        Returns list of (predicate_declaration, predicate_name) pairs.
+        """
+        effect = str(action.get("effect", ""))
+        params_str = str(action.get("parameters", "()"))
+
+        type_map: dict[str, str] = {}
+        for m in re.finditer(r"\?([a-zA-Z][\w-]*)\s*-\s*([a-zA-Z][\w-]*)", params_str):
+            type_map[m.group(1)] = m.group(2)
+
+        results: list[tuple[str, str]] = []
+        # Walk top-level expressions in effect (excluding and/or/not wrappers)
+        depth, start = 0, -1
+        exprs: list[str] = []
+        for i, c in enumerate(effect):
+            if c == "(":
+                if depth == 0: start = i
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    exprs.append(effect[start: i + 1])
+                    start = -1
+
+        def _collect(expr: str) -> None:
+            expr = expr.strip()
+            if not expr.startswith("("): return
+            inner = expr[1:-1].strip()
+            tokens = inner.split()
+            if not tokens: return
+            head = tokens[0]
+            if head in ("and", "or"):
+                sub_depth, sub_start = 0, -1
+                rest = inner[len(head):].strip()
+                for i2, c2 in enumerate(rest):
+                    if c2 == "(":
+                        if sub_depth == 0: sub_start = i2
+                        sub_depth += 1
+                    elif c2 == ")":
+                        sub_depth -= 1
+                        if sub_depth == 0 and sub_start != -1:
+                            _collect(rest[sub_start: i2 + 1])
+                            sub_start = -1
+            elif head == "not":
+                pass  # negation — skip (not a new state predicate)
+            else:
+                # Leaf predicate: (pred_name ?v1 ?v2 ...)
+                if head in existing_predicates:
+                    return
+                # Build parameter types from type_map
+                param_parts = []
+                for tok in tokens[1:]:
+                    if tok.startswith("?"):
+                        vname = tok[1:]
+                        vtype = type_map.get(vname, "item")
+                        param_parts.append(f"{tok} - {vtype}")
+                decl = f"({head} {' '.join(param_parts)})" if param_parts else f"({head})"
+                results.append((decl, head))
+
+        for expr in exprs:
+            _collect(expr)
+
+        seen: set[str] = set()
+        unique = []
+        for decl, name in results:
+            if name not in seen:
+                seen.add(name)
+                unique.append((decl, name))
+        return unique
+
     def _format_action(self, action: dict) -> str:
-        """Render an action dict to a PDDL (:action ...) string."""
-        name       = action.get("name", "unnamed")
-        parameters = action.get("parameters", "()")
-        precond    = action.get("precondition", "(and)")
-        effect     = action.get("effect", "(and)")
+        """Render an action dict to a PDDL (:action ...) string.
+
+        Handles VLM output quirks:
+        - parameters as list  → joins into a PDDL-style string
+        - natural-language precondition/effect → wraps in a comment, uses (and) fallback
+        """
+        name = action.get("name", "unnamed")
+
+        # parameters: VLM sometimes returns ["?x - item", "?y - item"] or ["x", "y"]
+        raw_params = action.get("parameters", "()")
+        if isinstance(raw_params, list):
+            parts = []
+            for p in raw_params:
+                p = str(p).strip()
+                if not p.startswith("?"):
+                    p = f"?{p} - item"
+                parts.append(p)
+            parameters = f"({' '.join(parts)})" if parts else "()"
+        else:
+            parameters = str(raw_params)
+
+        # precondition / effect: VLM sometimes writes natural language
+        def _sanitize_pddl(val, fallback):
+            s = str(val) if not isinstance(val, str) else val
+            # Heuristic: valid PDDL starts with ( and has balanced parens
+            s = s.strip()
+            if s.startswith("(") and s.count("(") == s.count(")"):
+                return s
+            # Natural language → treat as invalid, use fallback
+            return fallback
+
+        precond = _sanitize_pddl(action.get("precondition", "(and)"), "(and)")
+        effect  = _sanitize_pddl(action.get("effect",      "(and)"), "(and)")
         return (
             f"  (:action {name}\n"
             f"    :parameters {parameters}\n"

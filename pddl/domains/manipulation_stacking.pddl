@@ -1,9 +1,8 @@
-; Domain template 2 — Tabletop manipulation with stacking
+; Domain template 2: Tabletop manipulation with stacking
 ; Use when: objects may be stacked on top of each other.
-; Extends: manipulation_base — adds stacked-on, stack, unstack.
-; Phase: 1
+; Extends: manipulation_base (adds stacked-on, stack, unstack)
 ; Primitives covered: pick, place, look_at
-; PDDL actions: pick, unstack (both → PickPrimitive), place, stack (both → PlacePrimitive)
+; PDDL actions: pick, unstack (PickPrimitive), place, stack (PlacePrimitive)
 
 (define (domain manipulation-stacking)
   (:requirements :strips :typing)
@@ -19,7 +18,7 @@
     (clear ?i - item)                    ; nothing stacked on top of this item
     (holding ?i - item)
     (gripper-empty)
-    (reachable ?l - location)
+    (reachable ?o - object)
     (camera-aimed-at ?i - item)
   )
 

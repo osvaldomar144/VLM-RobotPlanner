@@ -43,17 +43,33 @@ echo "=== VLM-RobotPlanner: avvio simulazione ==="
 # ── 1. Permessi X11 ────────────────────────────────────────────────────────
 xhost +local: > /dev/null 2>&1
 
-# ── 2. Avvia container (se non è già in esecuzione) ────────────────────────
+# ── 2. Pulizia shared memory sull'host PRIMA di avviare il container ───────
+# Con ipc:host il container condivide /dev/shm con l'host. FastRTPS (ROS2 DDS)
+# crea file fastrtps_* e SEMAFORI sem.fastrtps_* per ogni nodo ROS2.
+# Se il container si ferma senza "docker compose down", questi restano con PID
+# orfani → il prossimo ros2 launch trova semafori bloccati → deadlock.
+# IMPORTANTE: devono essere rimossi PRIMA che docker compose up avvii il
+# container, altrimenti entrypoint.sh li trova già presenti.
+echo "    Pulizia shared memory FastRTPS sull'host..."
+# File fastrtps_* (segmenti shared memory dei partecipanti DDS)
+rm -f /dev/shm/fastrtps_* 2>/dev/null || true
+# Semafori sem.fastrtps_* — prefisso "sem." diverso da "fastrtps_*", erano mancanti
+rm -f /dev/shm/sem.fastrtps_* 2>/dev/null || true
+# Altri eventuali residui ROS2/Gazebo
+rm -f /dev/shm/ros_* /dev/shm/*.shm 2>/dev/null || true
+rm -f /tmp/.gazebo_master.lock /tmp/gazebo_*.lock 2>/dev/null || true
+
+# ── 3. Avvia container (se non è già in esecuzione) ────────────────────────
 cd "$REPO_ROOT/docker"
 docker compose up -d
 
-# ── 3. Pulizia stato precedente DENTRO il container ────────────────────────
-# Uccide i processi simulazione vecchi e pulisce le risorse DDS/ROS2.
-# Operare DENTRO il container preserva il namespace IPC condiviso (ipc:host)
-# evitando i conflitti di shared memory che bloccano gazebo_ros2_control.
-echo "    Pulizia processi precedenti..."
+# Attendi che il container sia pronto (entrypoint.sh fa colcon build ~2s)
+sleep 2.0
+
+# ── 4. Pulizia processi precedenti DENTRO il container ─────────────────────
+echo "    Pulizia processi precedenti nel container..."
 docker exec vlm_ros2 bash -c "
-    # 1. Kill processi simulazione
+    # Kill processi simulazione rimasti
     pkill -9 -f gzserver        2>/dev/null || true
     pkill -9 -f gzclient        2>/dev/null || true
     pkill -9 -f 'ros2 launch'   2>/dev/null || true
@@ -63,18 +79,12 @@ docker exec vlm_ros2 bash -c "
     pkill -9 -f controller_manager 2>/dev/null || true
     pkill -9 -f robot_state_pub 2>/dev/null || true
     pkill -9 -f static_transform 2>/dev/null || true
+    sleep 0.5
 
-    # Attendi terminazione
-    sleep 1.0
-
-    # 2. Pulisci shared memory DDS (Cyclone DDS usa /dev/shm)
-    #    Conflitti qui causano blocco di gazebo_ros2_control
-    rm -f /dev/shm/ros_* /dev/shm/fastrtps_* /dev/shm/*.shm 2>/dev/null || true
-
-    # 3. Pulisci file temporanei ROS2
+    # Pulisci file temporanei ROS2
     rm -f /tmp/ros_* /tmp/fastdds_* /tmp/.ros_* 2>/dev/null || true
 
-    # 4. Reinizializza daemon ROS2 per stato fresco
+    # Reinizializza daemon ROS2
     source /opt/ros/humble/setup.bash 2>/dev/null || true
     ros2 daemon stop 2>/dev/null || true
     sleep 0.3

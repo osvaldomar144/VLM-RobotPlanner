@@ -90,6 +90,7 @@ class MoveIt2Client:
         self._lock        = threading.Lock()
         self._done_event  = threading.Event()
         self._last_success = False
+        self._active_goal_handle = None   # for cancellation on timeout
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -135,6 +136,15 @@ class MoveIt2Client:
             self._node.get_logger().warn(
                 "MoveIt2Client: wait_until_executed timed out."
             )
+            # Cancel the active goal so the trajectory_execution_manager is
+            # freed and subsequent moves can execute normally.
+            gh = self._active_goal_handle
+            if gh is not None:
+                self._active_goal_handle = None
+                try:
+                    gh.cancel_goal_async()
+                except Exception:
+                    pass
         return self._last_success
 
     # ── Goal builders ─────────────────────────────────────────────────────────
@@ -281,7 +291,10 @@ class MoveIt2Client:
         req.link_name            = self._eef_link
         req.waypoints            = list(waypoints)
         req.max_step             = float(max_step)
-        req.jump_threshold       = 0.0
+        # 5.0 rad: rejects path segments where a joint jumps > 5x the average
+        # step. With TRAC-IK Distance solver this rarely fires in practice, but
+        # catches any residual IK flips before they reach ExecuteTrajectory.
+        req.jump_threshold       = 5.0
         req.avoid_collisions     = True
         # Note: max_velocity/acceleration_scaling_factor not available in
         # GetCartesianPath.Request on ROS2 Humble — velocity is applied
@@ -337,9 +350,11 @@ class MoveIt2Client:
             )
             self._done_event.set()
             return
+        self._active_goal_handle = gh
         gh.get_result_async().add_done_callback(self._on_exec_result)
 
     def _on_exec_result(self, future) -> None:
+        self._active_goal_handle = None
         response = future.result()
         if response is None:
             self._node.get_logger().warn(
@@ -385,9 +400,11 @@ class MoveIt2Client:
             )
             self._done_event.set()
             return
+        self._active_goal_handle = gh
         gh.get_result_async().add_done_callback(self._on_result)
 
     def _on_result(self, future) -> None:
+        self._active_goal_handle = None
         response = future.result()
         if response is None:
             self._node.get_logger().warn(

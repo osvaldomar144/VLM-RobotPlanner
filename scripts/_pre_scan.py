@@ -77,7 +77,6 @@ def main() -> None:
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
-    # Wait for orchestrator to be ready before injecting
     t0 = time.time()
     while "ready" not in node.status.lower() and (time.time() - t0) < 10.0:
         executor.spin_once(timeout_sec=0.1)

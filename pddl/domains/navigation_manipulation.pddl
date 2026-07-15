@@ -1,11 +1,9 @@
-; Domain template 4 — Navigation + manipulation (mobile base + arm)
+; Domain template 4: Navigation + manipulation (mobile base + arm)
 ; Use when: robot must move between zones before manipulating objects.
-; Extends: manipulation_stacking — adds zone type, at-robot predicate,
-;          navigate-to action, and zone-awareness in pick/place.
-; Phase: 3
+; Extends: manipulation_stacking (adds zone type, at-robot predicate, navigate-to)
 ; New primitives: navigate_to
-; PDDL action: navigate-to → NavigatePrimitive (Nav2)
-; Note: pick/place require the robot to be in the correct zone first.
+; PDDL action: navigate-to (NavigatePrimitive via Nav2)
+; Note: pick/place require robot to be in correct zone first
 
 (define (domain manipulation-navigation)
   (:requirements :strips :typing)
@@ -22,7 +20,7 @@
     (clear ?i - item)
     (holding ?i - item)
     (gripper-empty)
-    (reachable ?l - location)            ; arm reach within current zone
+    (reachable ?o - object)              ; object (item or location) within arm reach
     (at-robot ?z - zone)                 ; current robot base position
     (location-in-zone ?l - location ?z - zone) ; which zone a surface belongs to
     (camera-aimed-at ?i - item)
